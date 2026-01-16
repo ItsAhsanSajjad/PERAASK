@@ -3,6 +3,7 @@ openai                 # OpenAI API client
 numpy                  # Numerical computing
 faiss-cpu              # Vector search (CPU version)
 python-dotenv          # Load environment variables from .env
+streamlit              # Streamlit app framework
 
 # --- Streamlit stack (for web UI demos) ---
 streamlit              # Streamlit app framework
