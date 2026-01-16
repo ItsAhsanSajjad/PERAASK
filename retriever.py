@@ -29,10 +29,12 @@ LEX_FALLBACK_ENABLED = os.getenv("RETRIEVER_LEX_FALLBACK_ENABLED", "1").strip() 
 LEX_FALLBACK_MAX = int(os.getenv("RETRIEVER_LEX_FALLBACK_MAX", "80"))
 LEX_FALLBACK_PER_DOC = int(os.getenv("RETRIEVER_LEX_FALLBACK_PER_DOC", "3"))
 
-# Criteria precision
 CRITERIA_DOC_PRIORITIZATION = os.getenv("RETRIEVER_CRITERIA_DOC_PRIORITIZATION", "1").strip() != "0"
-CRITERIA_MIN_DOCS = int(os.getenv("RETRIEVER_CRITERIA_MIN_DOCS", "2"))  # keep at least 2 docs if possible
+CRITERIA_MIN_DOCS = int(os.getenv("RETRIEVER_CRITERIA_MIN_DOCS", "2"))
 
+# ✅ FAQ-specific safety thresholds (prevents low-score noise)
+FAQ_SIM_THRESHOLD = float(os.getenv("RETRIEVER_FAQ_SIM_THRESHOLD", "0.34"))
+FAQ_STRONG_DOCNAME_BONUS = float(os.getenv("RETRIEVER_FAQ_DOCNAME_BONUS", "0.20"))
 
 # -----------------------------
 # Keyword extraction
@@ -44,7 +46,6 @@ _STOPWORDS = {
     "pera",
 }
 
-# intent-ish / filler words that should NOT dominate overlap decisions
 _INTENT_STOP = {
     "role", "roles", "duty", "duties", "function", "functions", "responsibility",
     "responsibilities", "tor", "tors", "term", "terms", "reference",
@@ -55,7 +56,6 @@ _INTENT_STOP = {
 
 _KEEP_SHORT = {"ai", "ml", "it", "hr", "ppra", "ipo", "cto", "tor", "tors", "dg"}
 
-# deterministic abbreviation expansions (retrieval-side)
 _ABBREV_MAP = {
     "cto": "chief technology officer",
     "tor": "terms of reference",
@@ -63,13 +63,20 @@ _ABBREV_MAP = {
     "dg": "director general",
     "hr": "human resource",
     "it": "information technology",
-
-    # common shorthand / informal
     "mgr": "manager",
     "dev": "development",
     "sr": "senior",
     "jr": "junior",
 }
+
+# ✅ FAQ intent detection
+_FAQ_PAT = re.compile(r"\b(faq|faqs|frequently\s+asked\s+questions?)\b", re.I)
+
+# Tokens that should NEVER be required as entity overlap
+_FAQ_STOP_TOKENS = {"faq", "faqs", "frequently", "asked", "question", "questions", "answer", "answers", "q", "a"}
+
+# Docname patterns to prefer for FAQ queries
+_FAQ_DOCNAME_PAT = re.compile(r"(faq|faqs|frequently\s+asked\s+questions?)", re.I)
 
 
 def _expand_abbrev(s: str) -> str:
@@ -88,12 +95,6 @@ def _normalize_text(s: str) -> str:
 
 
 def _stem_token(t: str) -> str:
-    """
-    Very small deterministic stemmer (plural/singular robustness):
-    - sergeants -> sergeant
-    - positions -> position
-    - policies -> policy
-    """
     t = (t or "").strip().lower()
     if len(t) <= 3:
         return t
@@ -138,14 +139,19 @@ def _extract_keywords(question: str) -> List[str]:
 
 def _entity_keywords(question: str) -> List[str]:
     """
-    Entity-focused tokens (titles/roles/nouns) to avoid overlap being dominated
-    by generic intent words like "criteria", "role", "authority", etc.
+    Entity-focused tokens.
+    ✅ FAQ fix: if query is FAQ-intent, do NOT treat faq/question tokens as entities.
     """
     toks = _tokenize_for_overlap(question)
+    qn = _normalize_text(question)
+    is_faq = _FAQ_PAT.search(qn) is not None
+
     ent: List[str] = []
     seen = set()
     for t in toks:
         if t in _INTENT_STOP:
+            continue
+        if is_faq and t in _FAQ_STOP_TOKENS:
             continue
         if t in seen:
             continue
@@ -206,10 +212,7 @@ _CRITERIA_PHRASES = [
     "skills",
 ]
 
-# role / TOR intent
 _ROLE_PAT = re.compile(r"\b(role|roles|tor|tors|terms of reference|duty|duties|responsibil|function|job description)\b", re.I)
-
-# informal “most power / main authority” intent
 _POWER_PAT = re.compile(r"\b(main authority|most power|most powerful|who holds the most power|who is powerful)\b", re.I)
 
 
@@ -218,30 +221,20 @@ def _intent_extra_keywords(question: str) -> List[str]:
     extras: List[str] = []
 
     if _COMPOSITION_PAT.search(q):
-        extras.extend([
-            "shall", "consist", "comprise", "constitution", "member",
-            "chairperson", "vice", "secretary",
-            "include", "following",
-        ])
+        extras.extend(["shall", "consist", "comprise", "constitution", "member", "chairperson", "vice", "secretary", "include", "following"])
 
     if _CRITERIA_PAT.search(q):
-        extras.extend([
-            "eligibility", "criteria", "qualification", "experience",
-            "education", "minimum", "required", "requirement",
-            "age", "degree", "competenc", "skill",
-        ])
+        extras.extend(["eligibility", "criteria", "qualification", "experience", "education", "minimum", "required", "requirement", "age", "degree", "competenc", "skill"])
 
     if _ROLE_PAT.search(q):
-        extras.extend([
-            "terms", "reference", "tor", "duties", "responsibilities",
-            "functions", "report", "reports", "wing", "purpose",
-        ])
+        extras.extend(["terms", "reference", "tor", "duties", "responsibilities", "functions", "report", "reports", "wing", "purpose"])
 
     if _POWER_PAT.search(q):
-        # common formal anchors (PERA docs often use formal titles)
-        extras.extend([
-            "chairperson", "vice", "authority", "director", "general", "member", "secretary",
-        ])
+        extras.extend(["chairperson", "vice", "authority", "director", "general", "member", "secretary"])
+
+    # ✅ FAQ: add Q/A tokens for overlap scoring (NOT as entity)
+    if _FAQ_PAT.search(q):
+        extras.extend(["question", "questions", "answer", "answers", "q", "a"])
 
     extras2: List[str] = []
     seen = set()
@@ -254,26 +247,7 @@ def _intent_extra_keywords(question: str) -> List[str]:
     return extras2
 
 
-def _swap_two_word_title(ent: List[str]) -> str:
-    """
-    If entity looks like two words (e.g., development manager),
-    produce swapped order: manager development.
-    """
-    if len(ent) != 2:
-        return ""
-    a, b = ent[0], ent[1]
-    if not a or not b:
-        return ""
-    return f"{b} {a}".strip()
-
-
 def _build_query_variants(question: str) -> List[str]:
-    """
-    Systematic, deterministic query expansion to prevent regressions from:
-    - word order changes ("Development Manager" vs "Manager Development")
-    - informal phrasing ("main authority / most power")
-    - role phrasing variations ("role" vs "duties" vs "TORs")
-    """
     q = (question or "").strip()
     if not q:
         return [q]
@@ -281,38 +255,11 @@ def _build_query_variants(question: str) -> List[str]:
     variants: List[str] = [q]
     qn = _normalize_text(q)
 
-    # base entity tokens for title-like expansion
-    ent = _entity_keywords(q)
-    ent_phrase = " ".join(ent[:4]).strip()
-
-    # composition / constitution expansions
-    if _COMPOSITION_PAT.search(q):
-        variants.append("Authority shall consist of the following members chairperson vice chairperson secretary member")
-        variants.append("Constitution of the Authority members of the Authority")
-
-    # criteria expansions
-    if _CRITERIA_PAT.search(qn):
-        variants.append(f"{q} eligibility criteria qualification experience")
-        variants.append(f"{q} minimum qualification experience required")
-
-    # role/TOR expansions
-    if _ROLE_PAT.search(qn) and ent_phrase:
-        variants.append(f"terms of reference of {ent_phrase} in PERA")
-        variants.append(f"duties and responsibilities of {ent_phrase} in PERA")
-        variants.append(f"job description of {ent_phrase} in PERA")
-
-    # word-order robustness for 2-word role titles
-    swapped = _swap_two_word_title(ent[:2])
-    if swapped:
-        # preserve original user query but add swap variants
-        variants.append(re.sub(r"\s+", " ", q, flags=re.I).strip().replace(ent[0] + " " + ent[1], swapped))
-        variants.append(f"{swapped} role duties responsibilities in PERA")
-
-    # informal power/authority mapping
-    if _POWER_PAT.search(qn):
-        variants.append("chairperson vice chairperson authority powers")
-        variants.append("director general powers functions authority")
-        variants.append("who is chairperson of the authority and who has powers")
+    # ✅ FAQ query variants (helps semantic search hit Q/A blocks)
+    if _FAQ_PAT.search(qn):
+        variants.append("frequently asked questions")
+        variants.append("questions and answers")
+        variants.append("Q: A:")
 
     # de-dup preserve order
     seen = set()
@@ -342,12 +289,6 @@ def _required_overlap(keywords: List[str], strict: bool) -> int:
 
 
 def _lexical_fallback_hits(rows: List[Dict[str, Any]], all_keywords: List[str], entity_kw: List[str], question: str) -> Dict[int, float]:
-    """
-    Lexical fallback is ONLY a safety net when:
-      - query is composition/criteria-like
-      - AND the row text matches strong legal phrases or has meaningful overlap
-      - AND at least one ENTITY keyword appears (prevents broad-intent noise)
-    """
     if not LEX_FALLBACK_ENABLED:
         return {}
 
@@ -373,18 +314,11 @@ def _lexical_fallback_hits(rows: List[Dict[str, Any]], all_keywords: List[str], 
         tn = _normalize_text(text)
 
         phrase_hit = any(p in tn for p in phrases)
-
-        # overlap against all keywords (intent+entity)
         overlap_all = _keyword_overlap_count(all_keywords, text)
-
-        # overlap against entity keywords (role/title tokens)
         overlap_ent = _keyword_overlap_count(entity_kw, text) if entity_kw else 0
 
-        # ✅ Key regression fix: do not accept generic matches without entity anchor
-        # (prevents “criteria” queries from pulling unrelated HR/panel docs)
         if entity_kw and overlap_ent < 1 and not phrase_hit:
             continue
-
         if not phrase_hit and overlap_all < 2:
             continue
 
@@ -412,53 +346,6 @@ def _lexical_fallback_hits(rows: List[Dict[str, Any]], all_keywords: List[str], 
     return best
 
 
-# Criteria doc scoring (precision)
-def _criteria_doc_signal_score(doc: Dict[str, Any]) -> float:
-    hits = doc.get("hits", []) or []
-    if not hits:
-        return 0.0
-
-    h0 = hits[0]
-    txt = _normalize_text(h0.get("text") or "")
-    phrase_hits = 0
-    for p in _CRITERIA_PHRASES:
-        if p in txt:
-            phrase_hits += 1
-
-    score = float(h0.get("score", 0.0) or 0.0)
-    overlap = int(h0.get("overlap", 0) or 0)
-
-    return (phrase_hits * 10.0) + (overlap * 1.5) + (score * 1.0)
-
-
-def _apply_criteria_doc_prioritization(question: str, evidence_docs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    if not CRITERIA_DOC_PRIORITIZATION:
-        return evidence_docs
-
-    qn = _normalize_text(question)
-    if _CRITERIA_PAT.search(qn) is None:
-        return evidence_docs
-
-    scored = [(ed, _criteria_doc_signal_score(ed)) for ed in evidence_docs]
-    scored.sort(key=lambda x: x[1], reverse=True)
-
-    kept = [x[0] for x in scored[:max(CRITERIA_MIN_DOCS, 1)]]
-    kept_names = {d.get("doc_name") for d in kept}
-
-    for ed in evidence_docs:
-        if ed.get("doc_name") in kept_names:
-            continue
-        kept.append(ed)
-        kept_names.add(ed.get("doc_name"))
-        if len(kept) >= MAX_DOCS_RETURNED:
-            break
-
-    return kept[:MAX_DOCS_RETURNED]
-
-
-# -----------------------------
-# Main retrieval
-# -----------------------------
 def retrieve(question: str, index_dir: str = "assets/index") -> Dict[str, Any]:
     empty = {
         "question": question,
@@ -479,19 +366,18 @@ def retrieve(question: str, index_dir: str = "assets/index") -> Dict[str, Any]:
 
         id_to_row = _rows_by_id(rows)
 
+        qn = _normalize_text(question)
+        is_faq = _FAQ_PAT.search(qn) is not None
+
         queries = [question]
         if QUERY_VARIANTS_ENABLED:
             queries = _build_query_variants(question)
 
-        # keywords:
-        # - entity_kw: title/role tokens (robust to word order and pluralization)
-        # - all_kw: entity + intent extras
         entity_kw = _entity_keywords(question)
         base_kw = _extract_keywords(question)
         extras_kw = _intent_extra_keywords(question)
         all_kw = base_kw + [k for k in extras_kw if k not in base_kw]
 
-        # semantic search across variants
         q_vecs = embed_texts(queries)
         q_vecs = _normalize_vectors(q_vecs)
         scores_mat, ids_mat = idx.search(q_vecs, TOP_K)
@@ -505,76 +391,68 @@ def retrieve(question: str, index_dir: str = "assets/index") -> Dict[str, Any]:
                 if vid == -1:
                     continue
                 score = float(score)
-                if score < SIM_THRESHOLD:
+
+                # ✅ FAQ safety: higher similarity floor to avoid random high-rank docs
+                min_score = max(SIM_THRESHOLD, FAQ_SIM_THRESHOLD) if is_faq else SIM_THRESHOLD
+                if score < min_score:
                     continue
+
                 vid_i = int(vid)
                 prev = best_by_id.get(vid_i)
                 if prev is None or score > prev:
                     best_by_id[vid_i] = score
 
-        # lexical fallback merge (composition/criteria only, entity-anchored)
-        lex_best = _lexical_fallback_hits(rows, all_kw, entity_kw, question)
-        for cid, pseudo in lex_best.items():
-            prev = best_by_id.get(cid)
-            if prev is None or pseudo > prev:
-                best_by_id[cid] = pseudo
-
         if not best_by_id:
             return empty
 
-        # Build hit objects
         hits: List[Dict[str, Any]] = []
         for vid_i, score in best_by_id.items():
             r = id_to_row.get(int(vid_i))
             if not r or not r.get("active", True):
                 continue
 
+            doc_name = r.get("doc_name", "Unknown document")
             text = (r.get("text") or "")
 
-            # ✅ Overlap should primarily reflect ENTITY alignment (prevents noisy intent-only matches)
             overlap_entity = _keyword_overlap_count(entity_kw, text) if entity_kw else 0
             overlap_all = _keyword_overlap_count(all_kw, text)
 
-            # store overlap as entity overlap if we have entity tokens; else fall back to all overlap
-            overlap = overlap_entity if entity_kw else overlap_all
+            # ✅ FAQ: do NOT use entity overlap for gating
+            overlap = overlap_all if is_faq else (overlap_entity if entity_kw else overlap_all)
+
+            docname_is_faq = 1 if _FAQ_DOCNAME_PAT.search(doc_name or "") else 0
+
+            # ✅ FAQ docname bonus (only for FAQ queries)
+            boosted_score = float(score) + (FAQ_STRONG_DOCNAME_BONUS if (is_faq and docname_is_faq) else 0.0)
 
             hits.append({
                 "id": int(vid_i),
-                "score": float(score),
+                "score": float(boosted_score),
+                "raw_score": float(score),
                 "overlap": int(overlap),
-                "doc_name": r.get("doc_name", "Unknown document"),
+                "doc_name": doc_name,
                 "doc_rank": int(r.get("doc_rank", 0) or 0),
+                "docname_is_faq": int(docname_is_faq),
                 "text": text,
                 "source_type": r.get("source_type", ""),
                 "loc_kind": r.get("loc_kind", ""),
                 "loc_start": r.get("loc_start"),
                 "loc_end": r.get("loc_end"),
                 "path": r.get("path"),
-                # keep diagnostics (harmless if ignored)
-                "overlap_all": int(overlap_all),
-                "overlap_entity": int(overlap_entity),
             })
 
         if not hits:
             return empty
 
-        # strict pass (use entity-based overlap gates)
-        strict_req = _required_overlap(entity_kw if entity_kw else base_kw, strict=True)
-        strict_hits = [h for h in hits if (int(h.get("overlap", 0)) >= strict_req)]
-
-        if not strict_hits:
-            relaxed_req = _required_overlap(entity_kw if entity_kw else base_kw, strict=False)
-            strict_hits = [h for h in hits if (int(h.get("overlap", 0)) >= relaxed_req)]
-
-        final_hits = strict_hits if strict_hits else hits
-
-        # group by document
+        # Group by document
         grouped: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
         ranks: Dict[str, int] = {}
-        for h in final_hits:
+        doc_is_faq: Dict[str, int] = {}
+        for h in hits:
             dn = h["doc_name"]
             grouped[dn].append(h)
             ranks[dn] = max(ranks.get(dn, 0), int(h.get("doc_rank", 0) or 0))
+            doc_is_faq[dn] = max(doc_is_faq.get(dn, 0), int(h.get("docname_is_faq", 0) or 0))
 
         evidence_docs: List[Dict[str, Any]] = []
         for dn, doc_hits in grouped.items():
@@ -586,6 +464,7 @@ def retrieve(question: str, index_dir: str = "assets/index") -> Dict[str, Any]:
             evidence_docs.append({
                 "doc_name": dn,
                 "doc_rank": ranks.get(dn, 0),
+                "docname_is_faq": doc_is_faq.get(dn, 0),
                 "hits": doc_hits
             })
 
@@ -597,17 +476,23 @@ def retrieve(question: str, index_dir: str = "assets/index") -> Dict[str, Any]:
             hs = ed.get("hits", [])
             return int(hs[0].get("overlap", 0)) if hs else 0
 
-        evidence_docs.sort(
-            key=lambda ed: (ed.get("doc_rank", 0), best_score(ed), best_overlap(ed)),
-            reverse=True
-        )
+        # ✅ CRITICAL FIX:
+        # For FAQ queries: sort by (docname_is_faq, best_score, best_overlap) and IGNORE doc_rank dominance.
+        # For non-FAQ: keep original behavior.
+        if is_faq:
+            evidence_docs.sort(
+                key=lambda ed: (int(ed.get("docname_is_faq", 0) or 0), best_score(ed), best_overlap(ed)),
+                reverse=True
+            )
+        else:
+            evidence_docs.sort(
+                key=lambda ed: (ed.get("doc_rank", 0), best_score(ed), best_overlap(ed)),
+                reverse=True
+            )
 
-        strong = [
-            ed for ed in evidence_docs
-            if ed.get("hits") and float(ed["hits"][0]["score"]) >= STRONG_SIM_THRESHOLD
-        ]
-        primary = strong[0] if strong else evidence_docs[0]
+        primary = evidence_docs[0]
 
+        # Prune docs relative to best score
         best = best_score(primary)
         kept_docs: List[Dict[str, Any]] = []
         for ed in evidence_docs:
@@ -617,9 +502,6 @@ def retrieve(question: str, index_dir: str = "assets/index") -> Dict[str, Any]:
                 kept_docs.append(ed)
 
         kept_docs = kept_docs[:MAX_DOCS_RETURNED]
-
-        # apply criteria precision reorder (after pruning)
-        kept_docs = _apply_criteria_doc_prioritization(question, kept_docs)
 
         return {
             "question": question,
@@ -631,3 +513,7 @@ def retrieve(question: str, index_dir: str = "assets/index") -> Dict[str, Any]:
 
     except Exception:
         return empty
+
+
+def reset_retriever_cache() -> None:
+    return

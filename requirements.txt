@@ -1,7 +1,16 @@
-openai
-streamlit
-python-dotenv
-streamlit-mic-recorder
-streamlit-audiorecorder
-faiss-cpu 
-numpy 
+# --- Core AI/ML and utilities ---
+openai                 # OpenAI API client
+numpy                  # Numerical computing
+faiss-cpu              # Vector search (CPU version)
+python-dotenv          # Load environment variables from .env
+
+# --- Streamlit stack (for web UI demos) ---
+streamlit              # Streamlit app framework
+streamlit-mic-recorder # Microphone recorder component
+streamlit-audiorecorder # Audio recorder component
+
+# --- FastAPI stack (for API endpoints) ---
+fastapi                # FastAPI framework for building APIs
+uvicorn[standard]      # ASGI server to run FastAPI (with extras: httptools, websockets, watchdog)
+pydantic               # Data validation and schema definitions (used in request/response models)
+starlette              # Routing, middleware, and StaticFiles (FastAPI depends on it)

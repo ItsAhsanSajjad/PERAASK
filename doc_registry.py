@@ -4,8 +4,7 @@ import os
 import json
 import hashlib
 import re
-from dataclasses import dataclass
-from typing import List, Dict, Tuple
+from typing import List, Dict, Tuple, Optional
 
 
 SUPPORTED_EXTS = (".pdf", ".docx")
@@ -24,11 +23,6 @@ def _sha256_file(path: str) -> str:
 
 
 def _parse_book_rank(filename: str) -> int:
-    """
-    Priority rule you requested:
-    book1, book2, ... bookN => higher number = newer/higher priority.
-    If no match => rank 0.
-    """
     base = os.path.splitext(os.path.basename(filename))[0]
     m = re.search(r"\bbook\s*([0-9]+)\b", base, flags=re.IGNORECASE)
     if not m:
@@ -41,8 +35,8 @@ def _parse_book_rank(filename: str) -> int:
 
 def scan_assets_data(data_dir: str = "assets/data") -> List[Dict]:
     """
-    Scans assets/data for .pdf and .docx.
-    Returns list of dict entries with basic file metadata.
+    Scans assets/data for .pdf and .docx (top-level only).
+    Excludes MS Word temp lock files (~$*.docx).
     """
     data_dir = data_dir.replace("\\", "/")
     if not os.path.isdir(data_dir):
@@ -50,9 +44,13 @@ def scan_assets_data(data_dir: str = "assets/data") -> List[Dict]:
 
     out: List[Dict] = []
     for name in os.listdir(data_dir):
+        if name.startswith("~$"):
+            continue
+
         full = os.path.join(data_dir, name).replace("\\", "/")
         if not os.path.isfile(full):
             continue
+
         low = name.lower()
         if not low.endswith(SUPPORTED_EXTS):
             continue
@@ -66,7 +64,6 @@ def scan_assets_data(data_dir: str = "assets/data") -> List[Dict]:
             "rank": _parse_book_rank(name),
         })
 
-    # Sort by rank desc (newest first), then by filename
     out.sort(key=lambda x: (-x["rank"], x["filename"].lower()))
     return out
 
@@ -96,10 +93,6 @@ def compare_with_manifest(
 ) -> Tuple[List[Dict], List[Dict], List[Dict], Dict]:
     """
     Returns (new_or_changed, unchanged, removed, updated_manifest)
-
-    - new_or_changed: files not in manifest OR hash changed OR size changed OR mtime changed
-    - unchanged: files same as manifest
-    - removed: files present in manifest but no longer present in assets/data
     """
     index_dir = index_dir.replace("\\", "/")
     _safe_mkdir(index_dir)
@@ -112,16 +105,22 @@ def compare_with_manifest(
     new_or_changed: List[Dict] = []
     unchanged: List[Dict] = []
 
+    sha_cache: Dict[str, str] = {}
+
+    def get_sha(p: str) -> Optional[str]:
+        if not compute_hash:
+            return None
+        if p in sha_cache:
+            return sha_cache[p]
+        sha_cache[p] = _sha256_file(p)
+        return sha_cache[p]
+
     for entry in scanned:
-        key = entry["filename"]  # keying by filename (simple + matches your requirement)
+        key = entry["filename"]
         current_keys.add(key)
 
         prev = mf_files.get(key)
-        # Compute hash only when needed (but compute_hash=True recommended)
-        if compute_hash:
-            entry_hash = _sha256_file(entry["path"])
-        else:
-            entry_hash = None
+        entry_hash = get_sha(entry["path"])
 
         entry_out = dict(entry)
         if entry_hash:
@@ -131,7 +130,6 @@ def compare_with_manifest(
             new_or_changed.append(entry_out)
             continue
 
-        # Compare against manifest
         changed = False
         if compute_hash and prev.get("sha256") != entry_hash:
             changed = True
@@ -150,11 +148,9 @@ def compare_with_manifest(
         if key not in current_keys:
             removed.append(prev)
 
-    # Build updated manifest (only current scanned files)
     new_files_map: Dict[str, Dict] = {}
     for e in scanned:
-        # add sha256 if enabled
-        sha = _sha256_file(e["path"]) if compute_hash else mf_files.get(e["filename"], {}).get("sha256")
+        sha = get_sha(e["path"]) if compute_hash else mf_files.get(e["filename"], {}).get("sha256")
         new_files_map[e["filename"]] = {
             "filename": e["filename"],
             "path": e["path"],
@@ -166,8 +162,36 @@ def compare_with_manifest(
         }
 
     updated_manifest = {"version": 1, "files": new_files_map}
-
     return new_or_changed, unchanged, removed, updated_manifest
+
+
+def scan_status_only(
+    data_dir: str = "assets/data",
+    index_dir: str = "assets/index",
+    manifest_name: str = "manifest.json",
+) -> Dict:
+    """
+    UI-safe scan: does NOT write manifest.
+    """
+    scanned = scan_assets_data(data_dir=data_dir)
+    new_or_changed, unchanged, removed, _updated_manifest = compare_with_manifest(
+        scanned=scanned,
+        index_dir=index_dir,
+        manifest_name=manifest_name,
+        compute_hash=True
+    )
+
+    manifest_path = os.path.join(index_dir, manifest_name).replace("\\", "/")
+    return {
+        "found": len(scanned),
+        "new_or_changed": len(new_or_changed),
+        "unchanged": len(unchanged),
+        "removed": len(removed),
+        "new_or_changed_files": new_or_changed,
+        "removed_files": removed,
+        "data_dir": data_dir,
+        "manifest_path": manifest_path,
+    }
 
 
 def scan_and_update_manifest(
@@ -176,21 +200,7 @@ def scan_and_update_manifest(
     manifest_name: str = "manifest.json",
 ) -> Dict:
     """
-    One call convenience function used by Streamlit:
-    - scans assets/data
-    - compares with manifest
-    - writes manifest
-    - returns status dict for UI
-
-    Output example:
-      {
-        "found": 5,
-        "new_or_changed": 2,
-        "unchanged": 3,
-        "removed": 1,
-        "new_or_changed_files": [...],
-        "removed_files": [...],
-      }
+    This writes manifest. Use ONLY during ingestion/index build.
     """
     scanned = scan_assets_data(data_dir=data_dir)
     new_or_changed, unchanged, removed, updated_manifest = compare_with_manifest(

@@ -3,22 +3,23 @@ from __future__ import annotations
 import re
 import os
 import mimetypes
-from typing import List, Dict, Any, Optional, Tuple
+import hashlib
+import json
+from typing import List, Dict, Any, Tuple
 
 import streamlit as st
 from streamlit_mic_recorder import mic_recorder
 
 from speech import transcribe_audio
 
-# Step 3: auto-discovery + manifest status
-from doc_registry import scan_and_update_manifest
+# ✅ UI-safe scan (does NOT write manifest)
+from doc_registry import scan_status_only
 
-# Step 6–8 pipeline
+# Pipeline
 from index_store import scan_and_ingest_if_needed
-from retriever import retrieve
+from retriever import retrieve, reset_retriever_cache
 from answerer import answer_question
 
-# ✅ Smalltalk / greeting intent layer (runs BEFORE retrieval)
 from smalltalk_intent import decide_smalltalk
 
 
@@ -297,28 +298,42 @@ def _is_followup(text: str) -> bool:
 
 
 def _rewrite_followup_to_standalone(followup: str, last_question: str) -> str:
-    """
-    Critical fix:
-    Instead of reusing old retrieval, turn follow-up into a retrieval-friendly
-    standalone query using last_question (deterministic, no LLM).
-    """
     f = (followup or "").strip()
     lq = (last_question or "").strip()
     if not lq:
         return f
 
-    # If user is already asking a full standalone question, keep as-is
-    # (simple heuristic: longer query OR contains explicit PERA keywords)
     if len(f.split()) >= 10 or re.search(r"\b(pera|authority|regulation|policy|rule|notification|composition)\b", f, re.I):
         return f
 
-    # Default: anchor it to previous question
     return f"Regarding: {lq}\nFollow-up: {f}"
 
 
-# ---------------- Cached ingest ----------------
+# ---------------- Index signature to defeat caching ----------------
+def _compute_data_signature(data_dir: str = "assets/data") -> str:
+    items = []
+    try:
+        for name in os.listdir(data_dir):
+            if name.startswith("~$"):
+                continue
+            if not name.lower().endswith((".pdf", ".docx")):
+                continue
+            p = os.path.join(data_dir, name)
+            try:
+                st_ = os.stat(p)
+                items.append((name, int(st_.st_mtime), int(st_.st_size)))
+            except Exception:
+                items.append((name, 0, 0))
+    except Exception:
+        pass
+
+    items.sort()
+    raw = json.dumps(items, separators=(",", ":"), ensure_ascii=False)
+    return hashlib.sha1(raw.encode("utf-8")).hexdigest()
+
+
 @st.cache_resource(show_spinner=False)
-def _ensure_index_ready():
+def _ensure_index_ready(_sig: str, _version: int):
     return scan_and_ingest_if_needed(data_dir="assets/data", index_dir="assets/index")
 
 
@@ -334,6 +349,9 @@ if "last_retrieval" not in st.session_state:
     st.session_state.last_retrieval = None
 if "last_answer" not in st.session_state:
     st.session_state.last_answer = None
+
+if "index_version" not in st.session_state:
+    st.session_state.index_version = 0
 
 
 # ---------------- Core handler ----------------
@@ -360,24 +378,19 @@ def _handle_user_message(user_raw: str):
 
     is_follow = bool(last_q and _is_followup(prompt))
 
-    # ✅ NEW: follow-up -> retrieval-friendly rewrite (instead of reusing last_ret blindly)
     retrieval_query = prompt
     if is_follow:
         retrieval_query = _rewrite_followup_to_standalone(prompt, last_q)
 
     with st.spinner("PERA AI is thinking..."):
-        # 1) Preferred path: retrieve using the rewritten query (stays grounded, avoids wrong reuse)
         retrieval_used = retrieve(retrieval_query)
         composed_q_for_answerer = prompt
 
-        # give answerer the last question as context WITHOUT breaking retrieval
         if is_follow and last_q:
             composed_q_for_answerer = f"{prompt}\n\nContext (previous question): {last_q}"
 
-        raw = answer_question(composed_q_for_answerer, retrieval_used)
+        raw = answerer = answer_question(composed_q_for_answerer, retrieval_used)
 
-        # 2) Recovery path: if retrieval failed but we have last retrieval, try it once
-        #    (prevents premature refusal for very short follow-ups)
         if (
             isinstance(raw, dict)
             and (raw.get("answer") or "").strip() == "There is no information available to this question."
@@ -387,7 +400,6 @@ def _handle_user_message(user_raw: str):
             and last_ret.get("has_evidence")
         ):
             raw = answer_question(composed_q_for_answerer, last_ret)
-            # if recovery worked, use last_ret as retrieval_used for memory
             if isinstance(raw, dict) and (raw.get("answer") or "").strip() != "There is no information available to this question.":
                 retrieval_used = last_ret
 
@@ -395,10 +407,7 @@ def _handle_user_message(user_raw: str):
     final_answer = f"{ack} {answer}".strip() if ack else answer
     st.session_state.chat.append({"role": "assistant", "content": final_answer, "references": refs})
 
-    # ✅ Memory update rule:
-    # Update only when we truly have evidence, and keep last_question as the "topic question"
     if isinstance(retrieval_used, dict) and retrieval_used.get("has_evidence"):
-        # if this was a follow-up, keep last_question stable (topic remains same)
         if not is_follow:
             st.session_state.last_question = prompt
         st.session_state.last_retrieval = retrieval_used
@@ -418,8 +427,13 @@ with st.sidebar:
         st.rerun()
 
     if st.button("🔄 Refresh Index"):
+        st.session_state.index_version += 1
         st.cache_resource.clear()
         st.cache_data.clear()
+        try:
+            reset_retriever_cache()
+        except Exception:
+            pass
         st.success("Index refresh triggered. Rebuilding now…")
         st.rerun()
 
@@ -443,9 +457,20 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-# Step 3: status line
+# ✅ Ensure index first (so ingestion updates index/manifest correctly)
+sig = _compute_data_signature("assets/data")
+with st.spinner("Indexing documents (auto)..."):
+    ingest_status = _ensure_index_ready(sig, st.session_state.index_version)
+
+st.markdown(
+    f"<div class='doc-status'>🧠 Index: {ingest_status.get('chunks_added', 0)} chunks added "
+    f"(new/changed: {ingest_status.get('new_or_changed', 0)})</div>",
+    unsafe_allow_html=True,
+)
+
+# ✅ UI status scan AFTER ingest (read-only scan; does not write manifest)
 try:
-    status = scan_and_update_manifest(data_dir="assets/data", index_dir="assets/index")
+    status = scan_status_only(data_dir="assets/data", index_dir="assets/index")
     st.markdown(
         f"<div class='doc-status'>📚 Documents: {status['found']} found | "
         f"{status['new_or_changed']} new/changed | "
@@ -456,15 +481,6 @@ try:
 except Exception as e:
     st.markdown(f"<div class='doc-status'>📚 Document scan failed: {e}</div>", unsafe_allow_html=True)
 
-# Step 6: ensure index ready
-with st.spinner("Indexing documents (auto)..."):
-    ingest_status = _ensure_index_ready()
-
-st.markdown(
-    f"<div class='doc-status'>🧠 Index: {ingest_status.get('chunks_added', 0)} chunks added "
-    f"(new/changed: {ingest_status.get('new_or_changed', 0)})</div>",
-    unsafe_allow_html=True,
-)
 
 # ---------------- Dashboard cards ----------------
 c1, c2, c3, c4 = st.columns(4)
