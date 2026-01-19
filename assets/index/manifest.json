@@ -1,15 +1,6 @@
 {
   "version": 1,
   "files": {
-    "book21 Artificial Inteligence work details v2.pdf": {
-      "filename": "book21 Artificial Inteligence work details v2.pdf",
-      "path": "assets/data/book21 Artificial Inteligence work details v2.pdf",
-      "ext": ".pdf",
-      "mtime": 1767952583,
-      "size": 16726,
-      "rank": 21,
-      "sha256": "9232c2573dd6328ef9ce9fff5c09e5fd57a4b8e0fa0465af6b2438cd66e0e6b6"
-    },
     "(10 of 2024) The Punjab Enforcement and Regulation Bill 2024-B.pdf": {
       "filename": "(10 of 2024) The Punjab Enforcement and Regulation Bill 2024-B.pdf",
       "path": "assets/data/(10 of 2024) The Punjab Enforcement and Regulation Bill 2024-B.pdf",
@@ -81,6 +72,15 @@
       "size": 224574,
       "rank": 0,
       "sha256": "c2a9dc6d91d2b79942741a8ea9f3071cc84ab825958bdc5a7d6f925fa3578b25"
+    },
+    "Artificial Inteligence work details.pdf": {
+      "filename": "Artificial Inteligence work details.pdf",
+      "path": "assets/data/Artificial Inteligence work details.pdf",
+      "ext": ".pdf",
+      "mtime": 1767952583,
+      "size": 16726,
+      "rank": 0,
+      "sha256": "9232c2573dd6328ef9ce9fff5c09e5fd57a4b8e0fa0465af6b2438cd66e0e6b6"
     },
     "Compiled Working Paper_2nd Meeting PERA 03-07-2025.pdf": {
       "filename": "Compiled Working Paper_2nd Meeting PERA 03-07-2025.pdf",
