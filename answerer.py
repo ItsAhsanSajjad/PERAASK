@@ -18,12 +18,15 @@ REFUSAL_TEXT = "There is no information available to this question."
 ANSWER_MODEL = os.getenv("ANSWER_MODEL", "gpt-4.1-mini")
 MAX_EVIDENCE_CHARS = int(os.getenv("MAX_EVIDENCE_CHARS", "24000"))
 
-# Gates
-ANSWER_MIN_TOP_SCORE = float(os.getenv("ANSWER_MIN_TOP_SCORE", "0.45"))
-HIT_MIN_SCORE = float(os.getenv("HIT_MIN_SCORE", "0.40"))
+# Gates (typo-resilient while verifier remains strict)
+ANSWER_MIN_TOP_SCORE = float(os.getenv("ANSWER_MIN_TOP_SCORE", "0.38"))
+HIT_MIN_SCORE = float(os.getenv("HIT_MIN_SCORE", "0.35"))
 
 # if semantic score is strong, allow evidence even with low lexical overlap
-HIT_STRONG_SCORE_BYPASS = float(os.getenv("HIT_STRONG_SCORE_BYPASS", "0.62"))
+HIT_STRONG_SCORE_BYPASS = float(os.getenv("HIT_STRONG_SCORE_BYPASS", "0.55"))
+
+# keep additional supporting chunks from the same doc if doc has strong hit
+HIT_MEDIUM_SCORE_KEEP = float(os.getenv("HIT_MEDIUM_SCORE_KEEP", "0.48"))
 
 MAX_HITS_PER_DOC_FOR_PROMPT = int(os.getenv("MAX_HITS_PER_DOC_FOR_PROMPT", "4"))
 MAX_DOCS_FOR_PROMPT = int(os.getenv("MAX_DOCS_FOR_PROMPT", "4"))
@@ -53,7 +56,7 @@ def _refuse() -> Dict[str, Any]:
 # -----------------------------
 # Deterministic cleanup helpers
 # -----------------------------
-_BRACKET_CIT_RE = re.compile(r"\[[^\]]+\]")  # e.g. [Doc — p. 1]
+_BRACKET_CIT_RE = re.compile(r"\[[^\]]+\]")
 
 
 def _strip_inline_citations(text: str) -> str:
@@ -67,7 +70,7 @@ def _strip_inline_citations(text: str) -> str:
 
 
 # -----------------------------
-# Query normalization for lexical scoring
+# Query normalization for lexical scoring (typo + intent aware)
 # -----------------------------
 _STOPWORDS = {
     "the", "a", "an", "is", "are", "was", "were", "to", "of", "and", "or",
@@ -86,6 +89,27 @@ _ABBREV_MAP = {
     "ipo": "initial public offering",
 }
 
+_KEEP_SHORT = {"ai", "ml", "it", "hr", "ppra", "ipo", "cto", "tor", "tors", "dg", "pera"}
+
+# ✅ Domain aliases / common misspellings (mirror retriever.py)
+_COMMON_MISSPELLINGS = {
+    "pira": "pera",
+    "perra": "pera",
+    "peera": "pera",
+    "peraa": "pera",
+    "peraah": "pera",
+    "complant": "complaint",
+    "complaints": "complaint",
+}
+
+# ✅ Intent synonyms (question-side only; helps "vision of PERA" map to purpose/objectives/functions)
+_INTENT_SYNONYMS = {
+    "vision": ["purpose", "objectives", "functions", "mandate", "aim"],
+    "mission": ["purpose", "objectives", "functions", "mandate", "aim"],
+    "objective": ["objectives", "purpose", "aim"],
+    "objectives": ["purpose", "functions", "mandate", "aim"],
+}
+
 
 def _expand_abbreviations(q: str) -> str:
     s = (q or "").lower()
@@ -94,17 +118,63 @@ def _expand_abbreviations(q: str) -> str:
     return s
 
 
-def _tokenize(s: str) -> List[str]:
-    s = _expand_abbreviations(s or "")
+def _normalize_question_for_scoring(q: str) -> str:
+    """
+    Normalizes question for overlap checks:
+      - abbreviations expansion
+      - lowercase + basic cleanup
+      - common misspellings fix (pira->pera, complant->complaint)
+      - intent synonym expansion (vision/mission -> purpose/objectives/functions/mandate)
+    """
+    s = _expand_abbreviations(q or "")
+    s = s.lower()
     s = re.sub(r"[^a-z0-9\u0600-\u06FF\s]", " ", s)
     s = re.sub(r"\s+", " ", s).strip()
-    toks = []
-    for t in s.split(" "):
-        if len(t) < 3:
+
+    # misspellings
+    for k, v in _COMMON_MISSPELLINGS.items():
+        s = re.sub(rf"\b{re.escape(k)}\b", v, s)
+
+    # intent expansion (append synonyms rather than replace, to keep original intent)
+    toks = s.split()
+    extras: List[str] = []
+    for t in toks:
+        if t in _INTENT_SYNONYMS:
+            extras.extend(_INTENT_SYNONYMS[t])
+    if extras:
+        s = (s + " " + " ".join(extras)).strip()
+
+    return s
+
+
+def _stem_token(t: str) -> str:
+    t = (t or "").strip().lower()
+    if len(t) <= 3:
+        return t
+
+    if t.endswith("'s"):
+        t = t[:-2]
+
+    if t.endswith("ies") and len(t) > 4:
+        return t[:-3] + "y"
+    if t.endswith("es") and len(t) > 4:
+        return t[:-2]
+    if t.endswith("s") and not t.endswith("ss") and len(t) > 4:
+        return t[:-1]
+    return t
+
+
+def _tokenize(s: str) -> List[str]:
+    s = _normalize_question_for_scoring(s or "")
+    toks: List[str] = []
+    for t in s.split():
+        if not t:
             continue
         if t in _STOPWORDS:
             continue
-        toks.append(t)
+        if len(t) < 3 and t not in _KEEP_SHORT:
+            continue
+        toks.append(_stem_token(t))
     return toks
 
 
@@ -117,13 +187,71 @@ def _keyword_overlap(question: str, text: str) -> int:
 
 
 # -----------------------------
+# Tiny fuzzy lexical matching (edit distance <= 1)
+# Used ONLY to decide whether to keep evidence, not to generate content.
+# -----------------------------
+def _edit_distance_1(a: str, b: str) -> bool:
+    if a == b:
+        return True
+    la, lb = len(a), len(b)
+    if abs(la - lb) > 1:
+        return False
+
+    # substitution case
+    if la == lb:
+        diffs = 0
+        for x, y in zip(a, b):
+            if x != y:
+                diffs += 1
+                if diffs > 1:
+                    return False
+        return diffs == 1
+
+    # insertion/deletion: ensure a is shorter
+    if la > lb:
+        a, b = b, a
+        la, lb = lb, la
+
+    i = j = 0
+    mismatches = 0
+    while i < la and j < lb:
+        if a[i] == b[j]:
+            i += 1
+            j += 1
+        else:
+            mismatches += 1
+            if mismatches > 1:
+                return False
+            j += 1
+    return True
+
+
+def _keyword_overlap_fuzzy(question: str, text: str) -> int:
+    q_tokens = set(_tokenize(question))
+    if not q_tokens:
+        return 0
+    t_tokens = set(_tokenize(text))
+    if not t_tokens:
+        return 0
+
+    ov = 0
+    for qt in q_tokens:
+        if qt in t_tokens:
+            ov += 1
+            continue
+        # fuzzy only for longer tokens to reduce false positives
+        if len(qt) >= 6:
+            for tt in t_tokens:
+                if abs(len(qt) - len(tt)) <= 1 and _edit_distance_1(qt, tt):
+                    ov += 1
+                    break
+    return ov
+
+
+# -----------------------------
 # Paths / URLs
 # -----------------------------
 def _safe_default_url_path(doc_name: str) -> str:
-    """
-    Public path for FastAPI static mount:
-      /assets/data/<filename>
-    """
     dn = (doc_name or "").strip()
     if not dn:
         return "/assets/data"
@@ -131,37 +259,23 @@ def _safe_default_url_path(doc_name: str) -> str:
 
 
 def _normalize_public_path(path_or_url: str, doc_name: str) -> str:
-    """
-    Normalize any stored path into /assets/data/<file>.pdf
-    """
     p = (path_or_url or "").strip().replace("\\", "/")
 
-    # If already correct public path
     if p.startswith("/assets/data/"):
         return p
-
-    # If filesystem-ish relative
     if p.startswith("assets/data/"):
         return "/" + p
-
-    # If it's something like ".../assets/data/<file>"
     if "/assets/data/" in p:
         tail = p.split("/assets/data/", 1)[1]
         return "/assets/data/" + tail
-
-    # If it ends in a filename, use doc_name filename
     if p.lower().endswith(".pdf"):
         filename = p.split("/")[-1]
         return f"/assets/data/{filename}"
 
-    # fallback
     return _safe_default_url_path(doc_name)
 
 
 def _file_type_from_doc(doc_name: str, public_path: str) -> str:
-    """
-    We only want PDFs now. If something old leaks in, label it but still generate safe links.
-    """
     dn = (doc_name or "").lower().strip()
     pp = (public_path or "").lower().strip()
     if dn.endswith(".pdf") or pp.endswith(".pdf"):
@@ -182,19 +296,11 @@ def _make_snippet(text: str) -> str:
 
 
 def _build_open_url(public_path: str, url_hint: str) -> str:
-    """
-    Full open URL for web/mobile.
-    """
     return f"{BASE_URL}{public_path}{url_hint or ''}"
 
 
 def _build_download_url(doc_name: str) -> str:
-    """
-    Uses FastAPI endpoint:
-      /download/{filename}
-    """
     filename = (doc_name or "").strip()
-    # ensure safe URL encoding for spaces/special chars
     return f"{BASE_URL}/download/{quote(filename)}"
 
 
@@ -244,15 +350,22 @@ def _truncate_evidence_blocks(evidence_docs: List[Dict[str, Any]]) -> str:
 
 
 # -----------------------------
-# Evidence filtering
+# Evidence filtering (typo-resilient, semantic-first)
 # -----------------------------
 def _filter_evidence(question: str, evidence_docs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     filtered: List[Dict[str, Any]] = []
 
+    # ✅ normalize question for scoring so "pira"/"complant"/"vision" behave correctly
+    q_scoring = _normalize_question_for_scoring(question or "")
+
     for d in evidence_docs:
         hits = d.get("hits", []) or []
-        good_hits: List[Dict[str, Any]] = []
+        if not hits:
+            continue
 
+        doc_has_strong = any(float(h.get("score", 0.0) or 0.0) >= HIT_STRONG_SCORE_BYPASS for h in hits)
+
+        good_hits: List[Dict[str, Any]] = []
         for h in hits:
             score = float(h.get("score", 0.0) or 0.0)
             if score < HIT_MIN_SCORE:
@@ -262,6 +375,12 @@ def _filter_evidence(question: str, evidence_docs: List[Dict[str, Any]]) -> List
             if not txt:
                 continue
 
+            # 1) strong semantic always wins
+            if score >= HIT_STRONG_SCORE_BYPASS:
+                good_hits.append(h)
+                continue
+
+            # 2) retriever overlap if present
             retr_overlap = h.get("overlap")
             if retr_overlap is not None:
                 try:
@@ -273,12 +392,14 @@ def _filter_evidence(question: str, evidence_docs: List[Dict[str, Any]]) -> List
                 good_hits.append(h)
                 continue
 
-            lex_ov = _keyword_overlap(question, txt)
+            # 3) fuzzy lexical overlap using normalized question
+            lex_ov = _keyword_overlap_fuzzy(q_scoring, txt)
             if lex_ov > 0:
                 good_hits.append(h)
                 continue
 
-            if score >= HIT_STRONG_SCORE_BYPASS:
+            # 4) keep medium semantic supporting hits if doc already has a strong hit
+            if doc_has_strong and score >= HIT_MEDIUM_SCORE_KEEP:
                 good_hits.append(h)
                 continue
 
@@ -297,8 +418,6 @@ def _filter_evidence(question: str, evidence_docs: List[Dict[str, Any]]) -> List
 def _make_reference(hit: Dict[str, Any]) -> Dict[str, Any]:
     doc = hit.get("doc_name", "Unknown document")
 
-    # ✅ hard safety: we only want to expose PDFs now
-    # If doc_name is .docx somehow, still build paths but mark file_type
     raw_path = (hit.get("path") or "").strip()
     public_path = _normalize_public_path(raw_path, doc)
 
@@ -308,7 +427,6 @@ def _make_reference(hit: Dict[str, Any]) -> Dict[str, Any]:
 
     snippet = _make_snippet(hit.get("text") or "")
 
-    # url_hint supports page linking for PDFs
     url_hint = ""
     if loc_kind == "page" and loc_start is not None:
         url_hint = f"#page={loc_start}"
@@ -318,14 +436,9 @@ def _make_reference(hit: Dict[str, Any]) -> Dict[str, Any]:
 
     ref: Dict[str, Any] = {
         "document": doc,
-
-        # ✅ path remains URL path for static mount (backward compatible)
         "path": public_path,
-
-        # ✅ new fields for mobile/devs
         "open_url": open_url,
         "download_url": download_url,
-
         "file_type": _file_type_from_doc(doc, public_path),
         "loc_kind": loc_kind,
         "loc_start": loc_start,
@@ -384,31 +497,38 @@ def answer_question(question: str, retrieval: Dict[str, Any]) -> Dict[str, Any]:
     if not evidence_docs:
         return _refuse()
 
-    # Hard gate: top hit score AFTER filtering
+    # Hard gate: top hit score AFTER filtering (typo-safe)
     try:
         top_hit = (evidence_docs[0].get("hits") or [{}])[0]
         top_score = float(top_hit.get("score", 0.0) or 0.0)
     except Exception:
         top_score = 0.0
 
-    if top_score < ANSWER_MIN_TOP_SCORE:
+    total_hits = sum(len(d.get("hits") or []) for d in evidence_docs)
+
+    # ✅ refusal only if score low AND evidence is thin
+    if top_score < ANSWER_MIN_TOP_SCORE and total_hits < 2:
         return _refuse()
 
     evidence_text = _truncate_evidence_blocks(evidence_docs)
     if not evidence_text:
         return _refuse()
 
+    # ✅ Persona: Always act as PERA assistant (still evidence-only)
     system = (
-        "You are a strict document-grounded assistant.\n"
+        "You are the official AI assistant for PERA (Punjab Enforcement and Regulatory Authority).\n"
+        "You must answer as a PERA-focused assistant while remaining strictly document-grounded.\n"
         "RULES:\n"
         "1) Use ONLY the evidence blocks.\n"
-        "2) Do NOT guess.\n"
+        "2) Do NOT guess or add outside knowledge.\n"
         "3) If not explicitly supported, output exactly:\n"
         f"{REFUSAL_TEXT}\n"
         "4) Prefer the latest/highest-ranked document.\n"
         "5) If documents conflict, do NOT merge; describe each version.\n"
-        "6) IMPORTANT: Do NOT include citations, brackets, page numbers, or references in the answer text.\n"
+        "6) Do NOT include citations, brackets, page numbers, or references in the answer text.\n"
         "7) Keep the answer concise and professional.\n"
+        "8) If the user asks for 'vision' or 'mission' and the evidence describes purpose/objectives/functions/mandate,\n"
+        "   answer using those statements (without inventing a separate vision statement).\n"
     )
 
     user = (

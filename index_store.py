@@ -23,9 +23,10 @@ from chunker import chunk_units, Chunk
 # -----------------------------
 EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "text-embedding-3-small")
 
-# embedding/search format versions (force systematic rebuild when changed)
-EMBED_TEXT_VERSION = int(os.getenv("EMBED_TEXT_VERSION", "2"))
-SEARCH_TEXT_VERSION = int(os.getenv("SEARCH_TEXT_VERSION", "1"))
+# ✅ Bump defaults so improvements force a systematic rebuild unless env pins older versions.
+# If you already set these in .env, update them there too.
+EMBED_TEXT_VERSION = int(os.getenv("EMBED_TEXT_VERSION", "3"))
+SEARCH_TEXT_VERSION = int(os.getenv("SEARCH_TEXT_VERSION", "2"))
 
 MAX_EMBED_CHARS_PER_TEXT = int(os.getenv("MAX_EMBED_CHARS_PER_TEXT", "7000"))
 MAX_EMBED_CHARS_PER_BATCH = int(os.getenv("MAX_EMBED_CHARS_PER_BATCH", "120000"))
@@ -174,6 +175,89 @@ def _loc_label(loc_kind: Any, loc_start: Any, loc_end: Any) -> str:
         return str(loc_start)
     return ""
 
+
+# ✅ PERA identity + aliases for embeddings ONLY
+_PERA_IDENTITY_LINE = (
+    "ENTITY: PERA (Punjab Enforcement and Regulatory Authority, Punjab). "
+    "ALIASES: pira, perra, peera, peraa. "
+    "TOPICS: enforcement, regulation, scheduled laws, complaints, hearings, recruitment, HR, discipline, contracts."
+)
+
+# ✅ Richer tag patterns: improves retrieval for “complaint procedure”, “vision”, etc.
+_TAG_PATTERNS: List[Tuple[str, str]] = [
+    # composition / authority
+    (r"\bshall\s+consist\b", "composition"),
+    (r"\bconsist\s+of\b", "composition"),
+    (r"\bcomposition\b", "composition"),
+    (r"\bconstitution\b", "constitution"),
+    (r"\bmember(s)?\b", "members"),
+    (r"\bchairperson\b", "chairperson"),
+    (r"\bvice\s+chairperson\b", "vice chairperson"),
+    (r"\bsecretary\b", "secretary"),
+    (r"\bdirector\s+general\b", "director general"),
+
+    # complaint / hearings
+    (r"\bcomplaint(s)?\b", "complaint"),
+    (r"\bpublic\s+complaint(s)?\b", "public complaint"),
+    (r"\bhearing(s)?\b", "hearing"),
+    (r"\bhearing\s+officer\b", "hearing officer"),
+    (r"\bgrievance\b", "grievance"),
+    (r"\bappeal\b", "appeal"),
+    (r"\bprocedure\b", "procedure"),
+    (r"\bprocess\b", "process"),
+    (r"\bhow\s+to\b", "how to"),
+
+    # purpose / functions / mandate (vision-like queries map here)
+    (r"\bpurpose\b", "purpose"),
+    (r"\bobjective(s)?\b", "objectives"),
+    (r"\bfunction(s)?\b", "functions"),
+    (r"\bmandate\b", "mandate"),
+    (r"\bestablished\s+to\b", "established to"),
+    (r"\bvision\b", "vision"),
+    (r"\bmission\b", "mission"),
+
+    # HR / recruitment / criteria
+    (r"\brecruitment\b", "recruitment"),
+    (r"\beligibil", "eligibility"),
+    (r"\bqualification(s)?\b", "qualification"),
+    (r"\bexperience\b", "experience"),
+    (r"\bcontract(ual)?\b", "contract"),
+    (r"\bprobation\b", "probation"),
+    (r"\btermination\b", "termination"),
+    (r"\bdisciplin", "discipline"),
+    (r"\bmisconduct\b", "misconduct"),
+
+    # FAQ signals (important for complaint procedure in FAQ PDFs)
+    (r"\bfaq\b", "faq"),
+    (r"\bfrequently\s+asked\b", "faq"),
+    (r"\bquestion(s)?\b", "questions"),
+    (r"\banswer(s)?\b", "answers"),
+]
+
+def _derive_search_tags(raw_text: str) -> List[str]:
+    t = (raw_text or "")
+    tl = t.lower()
+    tags: List[str] = []
+
+    # Always include PERA tag if PERA appears or doc looks like PERA content
+    if "pera" in tl or "punjab enforcement" in tl or "enforcement and regulatory" in tl:
+        tags.append("pera")
+
+    for pat, tag in _TAG_PATTERNS:
+        if re.search(pat, t, flags=re.IGNORECASE):
+            tags.append(tag)
+
+    # De-dup preserving order
+    seen = set()
+    out: List[str] = []
+    for x in tags:
+        if x in seen:
+            continue
+        seen.add(x)
+        out.append(x)
+    return out
+
+
 def _build_embed_text_from_parts(
     doc_name: str,
     doc_rank: Any,
@@ -183,13 +267,33 @@ def _build_embed_text_from_parts(
     loc_end: Any,
     raw_text: str,
 ) -> str:
+    """
+    ✅ Key improvement:
+    Add PERA identity line + derived tags into embedding input (NOT into the raw evidence text).
+    This makes semantic retrieval robust for typos & indirect wording like:
+      - "complant procedure" -> complaint/hearing/FAQ
+      - "vision of pera" -> purpose/objectives/functions/mandate
+    """
     dn = (doc_name or "Unknown document").strip()
     stype = (source_type or "").strip()
     loc = _loc_label(loc_kind, loc_start, loc_end)
     rank = str(doc_rank) if doc_rank is not None else "0"
-    header = f"DOCUMENT: {dn}\nRANK: {rank}\nTYPE: {stype}\nLOCATION: {loc}\n"
+
     body = (raw_text or "").strip()
+    tags = _derive_search_tags(body)
+    tags_line = f"TAGS: {', '.join(tags)}" if tags else "TAGS:"
+
+    header = (
+        f"DOCUMENT: {dn}\n"
+        f"RANK: {rank}\n"
+        f"TYPE: {stype}\n"
+        f"LOCATION: {loc}\n"
+        f"{tags_line}\n"
+        f"{_PERA_IDENTITY_LINE}\n"
+    )
+
     return (header + "\n" + body).strip()
+
 
 def _build_embed_text_for_chunk(ch: Chunk) -> str:
     return _build_embed_text_from_parts(
@@ -213,30 +317,6 @@ def _build_embed_text_for_row(r: Dict[str, Any]) -> str:
         r.get("text", "") or "",
     )
 
-_TAG_PATTERNS: List[Tuple[str, str]] = [
-    (r"\bshall\s+consist\b", "composition"),
-    (r"\bconsist\s+of\b", "composition"),
-    (r"\bcomposition\b", "composition"),
-    (r"\bmember(s)?\b", "members"),
-    (r"\bchairperson\b", "chairperson"),
-    (r"\bvice\s+chairperson\b", "vice chairperson"),
-    (r"\bsecretary\b", "secretary"),
-]
-
-def _derive_search_tags(raw_text: str) -> List[str]:
-    t = (raw_text or "").lower()
-    tags: List[str] = []
-    for pat, tag in _TAG_PATTERNS:
-        if re.search(pat, t, flags=re.IGNORECASE):
-            tags.append(tag)
-    seen = set()
-    out: List[str] = []
-    for x in tags:
-        if x in seen:
-            continue
-        seen.add(x)
-        out.append(x)
-    return out
 
 def _build_search_text_from_parts(
     doc_name: str,
@@ -254,6 +334,7 @@ def _build_search_text_from_parts(
     tags = _derive_search_tags(body)
     tags_line = f"TAGS: {', '.join(tags)}" if tags else "TAGS:"
 
+    # Keep search_text separate; retriever may choose to use it later
     header = f"DOC: {dn}\nTYPE: {stype}\nLOC: {loc}\n{tags_line}\n"
     return (header + "\n" + body).strip()
 
@@ -276,6 +357,7 @@ def _build_search_text_for_row(r: Dict[str, Any]) -> str:
         r.get("loc_end"),
         r.get("text", "") or "",
     )
+
 
 def _needs_embed_version_rebuild(rows: List[Dict[str, Any]]) -> bool:
     for r in rows:
@@ -316,7 +398,7 @@ def _mark_inactive_for_doc(rows: List[Dict[str, Any]], doc_name: str) -> int:
 
 
 # -----------------------------
-# ✅ NEW: Manifest builder for cold-start rebuild
+# Manifest builder for cold-start rebuild
 # -----------------------------
 def _build_manifest_from_scanned(scanned: List[Dict[str, Any]]) -> Dict[str, Any]:
     files_map: Dict[str, Dict[str, Any]] = {}
@@ -355,22 +437,18 @@ def scan_and_ingest_if_needed(
 
     scanned = scan_assets_data(data_dir=data_dir)
 
-    # Read existing rows (if any)
     rows = _read_jsonl(chunks_path)
 
-    # ✅ Cold start detection: manifest may exist but index files are missing/empty
     chunks_missing_or_empty = (not os.path.exists(chunks_path)) or (os.path.getsize(chunks_path) == 0)
     faiss_missing = not os.path.exists(faiss_path)
     cold_start = FORCE_REBUILD_IF_INDEX_MISSING and (faiss_missing or chunks_missing_or_empty)
 
     if cold_start:
-        # Force full ingest of all scanned files
         new_or_changed = list(scanned)
         unchanged: List[Dict[str, Any]] = []
         removed: List[Dict[str, Any]] = []
         updated_manifest = _build_manifest_from_scanned(scanned)
 
-        # Start fresh rows
         rows = []
         start_id = 1
         deactivated = 0
@@ -382,21 +460,18 @@ def scan_and_ingest_if_needed(
             compute_hash=True
         )
 
-        # If embed/search versions differ, rebuild (permanent)
         if os.path.exists(faiss_path) and rows and (_needs_embed_version_rebuild(rows) or _needs_search_version_rebuild(rows)):
             _ = rebuild_index_from_chunks(index_dir=index_dir)
             rows = _read_jsonl(chunks_path)
 
         start_id = _next_chunk_id(rows)
 
-        # Deactivate removed docs
         deactivated = 0
         for r in removed:
             docname = r.get("filename") or r.get("name")
             if docname:
                 deactivated += _mark_inactive_for_doc(rows, docname)
 
-        # If nothing new/changed and index exists -> just persist manifest and deactivations
         if not new_or_changed and os.path.exists(faiss_path):
             _rewrite_jsonl(chunks_path, rows)
             with open(manifest_path, "w", encoding="utf-8") as f:
@@ -412,11 +487,9 @@ def scan_and_ingest_if_needed(
                 "cold_start_rebuild": False,
             }
 
-    # If we reach here: we will ingest changed files (or full set for cold start)
     changed_files = [e["path"] for e in new_or_changed]
     changed_names = [e["filename"] for e in new_or_changed]
 
-    # Deactivate previous chunks for changed docs
     for doc in changed_names:
         _ = _mark_inactive_for_doc(rows, doc)
 
@@ -445,7 +518,6 @@ def scan_and_ingest_if_needed(
         kept_chunks.append(c)
         embed_text_list.append(_build_embed_text_for_chunk(c))
 
-    # If extraction produced nothing, still write manifest
     if not embed_text_list:
         _rewrite_jsonl(chunks_path, rows)
         with open(manifest_path, "w", encoding="utf-8") as f:
@@ -468,7 +540,6 @@ def scan_and_ingest_if_needed(
 
     idx = _load_or_create_faiss(faiss_path, dim)
 
-    # If dim mismatch, rebuild from chunks (only makes sense if we had chunks)
     if idx.d != dim:
         rebuilt = rebuild_index_from_chunks(index_dir=index_dir)
         idx = rebuilt["index"]
@@ -505,9 +576,11 @@ def scan_and_ingest_if_needed(
             "loc_end": getattr(ch, "loc_end", None),
             "path": path,
 
+            # ✅ RAW evidence text stays clean
             "text": t,
             "text_sha256": _sha256_text(t),
 
+            # ✅ versions + embedding/search payload hashes
             "embed_text_version": int(EMBED_TEXT_VERSION),
             "embed_text_sha256": _sha256_text(embed_text),
 
