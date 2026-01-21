@@ -23,12 +23,13 @@ origins = [
     "http://172.23.112.1",   # Umer IP 
     "http://localhost:5173",
     "http://10.53.34.67:8501/"  # Add your frontend URL
-    "https://askpera.infinitysol.agency/",  # Production frontend URL
+    "https://askpera.infinitysol.agency/",
+    "https://pera360.punjab.gov.pk"  # Production frontend URL
 ]
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=origins,  # Allow specific origins
+    allow_origins=["*"],  # Allow specific origins
     allow_credentials=True,
     allow_methods=["GET", "POST", "OPTIONS"],  # Allow GET, POST, and OPTIONS methods
     allow_headers=["*"],  # Allow all headers (can be more restrictive)
