@@ -1,5 +1,13 @@
 {
-  "version": 1,
+  "version": 2,
+  "build": {
+    "embedding_model": "text-embedding-3-small",
+    "embed_model_version": 1,
+    "embed_text_version": 4,
+    "search_text_version": 3,
+    "chunk_max_chars": 4000,
+    "chunk_overlap_chars": 200
+  },
   "files": {
     "book21 Artificial Inteligence work details v2.pdf": {
       "filename": "book21 Artificial Inteligence work details v2.pdf",

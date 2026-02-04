@@ -29,12 +29,19 @@ class Chunk:
 _WS_RE = re.compile(r"[ \t]+")
 _NUL_RE = re.compile(r"\x00+")
 
+# Sentence-ish boundaries (English + Urdu punctuation)
+_SENT_BOUNDARY_RE = re.compile(r"([.!?]|[\u06D4\u061F])\s")  # ۔  ؟
+# Numeric heading like "1.", "1.1", "(a)", "2)" etc
+_NUM_HEADING_RE = re.compile(r"^\s*(\(?[0-9]+(\.[0-9]+){0,4}\)?[\)\.]|[\(\[]?[a-zA-Z][\)\.]|\([ivxIVX]+\))\s+")
+# Urdu heading-ish keywords
+_URDU_HEADING_RE = re.compile(r"^\s*(باب|حصہ|شق|دفعہ|ضمیمہ|شیڈول|فہرست)\b")
+
 # Keep unicode (Urdu) and punctuation. Only normalize whitespace.
 def _clean_text(s: str) -> str:
     s = s or ""
     s = _NUL_RE.sub(" ", s)
     s = s.replace("\r\n", "\n").replace("\r", "\n")
-    # IMPORTANT: collapse horizontal whitespace, but preserve newlines (structure)
+    # collapse horizontal whitespace, preserve newlines
     s = _WS_RE.sub(" ", s)
     s = re.sub(r"\n{4,}", "\n\n\n", s)
     s = "\n".join([ln.strip() for ln in s.split("\n")])
@@ -58,46 +65,90 @@ def _parse_book_rank(filename: str) -> int:
 
 # --- structural heuristics: detect tables/lists/headings ---
 _BULLET_RE = re.compile(r"^\s*([•\-\u2022]|\d+[\)\.]|[a-zA-Z][\)\.])\s+")
-# UPDATED: extractor now normalizes table spacing into " | "
 _PIPE_TABLE_RE = re.compile(r"\s\|\s")  # " | " delimiter
-# fallback if something still contains tabs
 _TAB_TABLE_RE = re.compile(r"\t+")
+_MULTI_SPACE_COL_RE = re.compile(r"\s{2,}")  # raw column-like spacing
 
-_HEADING_RE = re.compile(r"^\s*(schedule|annex|annexure|appendix|chapter|section)\b", re.I)
+_HEADING_RE = re.compile(r"^\s*(schedule|annex|annexure|appendix|chapter|section|rule|article|clause)\b", re.I)
+
 
 def _looks_like_table_line(line: str) -> bool:
+    """
+    Improved table detection:
+    - pipe tables (" | ")
+    - tabs
+    - multi-space aligned columns
+    """
     if not line:
         return False
     s = line.strip()
-    if len(s) < 18:
+    if len(s) < 12:
         return False
-    # Strong signal: pipe-delimited columns from updated extractor
+
+    # Pipe table: allow smaller rows, but require at least 1 delimiter + multiple tokens
     if _PIPE_TABLE_RE.search(s):
-        # require at least 2 separators to reduce false positives
-        return s.count("|") >= 2
-    # fallback: tabs suggest columns
+        if s.count("|") >= 1:
+            toks = re.findall(r"[A-Za-z\u0600-\u06FF0-9]{2,}", s)
+            return len(toks) >= 3
+
+    # Tabs strongly indicate a table
     if _TAB_TABLE_RE.search(s):
         return True
+
+    # Multi-space columns: require multiple gaps and multiple tokens
+    if _MULTI_SPACE_COL_RE.search(s):
+        # Avoid treating normal sentences as tables: must have multiple big gaps
+        gaps = len(re.findall(r"\s{3,}", s))
+        if gaps >= 2:
+            toks = re.findall(r"[A-Za-z\u0600-\u06FF0-9]{2,}", s)
+            return len(toks) >= 4
+
     return False
+
 
 def _looks_like_list_line(line: str) -> bool:
     if not line:
         return False
-    return _BULLET_RE.search(line) is not None
+    s = line.strip()
+    if _BULLET_RE.search(s) is not None:
+        return True
+    # also treat "•" anywhere at start, and Urdu/Arabic bullet-like dash
+    if s.startswith(("•", "-", "–", "—")) and len(s) > 6:
+        return True
+    # numeric list: "1)" "2." "a)" etc
+    if _NUM_HEADING_RE.search(s) is not None:
+        return True
+    return False
+
 
 def _looks_like_table_or_list(line: str) -> bool:
     return _looks_like_list_line(line) or _looks_like_table_line(line)
+
 
 def _is_heading(line: str) -> bool:
     if not line:
         return False
     s = line.strip()
+    if not s:
+        return False
+
+    # common English heading keywords
     if _HEADING_RE.search(s):
         return True
-    # short ALL-CAPS headings
-    letters = re.sub(r"[^A-Za-z]+", "", s)
-    if 4 <= len(letters) <= 40 and letters.isupper():
+
+    # Urdu heading keywords
+    if _URDU_HEADING_RE.search(s):
         return True
+
+    # numbered headings like "1. Definitions" / "(a) Scope" etc
+    if _NUM_HEADING_RE.search(s) and len(s) <= 120:
+        return True
+
+    # short ALL-CAPS headings (English only; don't break Urdu)
+    letters = re.sub(r"[^A-Za-z]+", "", s)
+    if 4 <= len(letters) <= 60 and letters.isupper() and len(s) <= 90:
+        return True
+
     return False
 
 
@@ -106,7 +157,7 @@ def _split_into_blocks(text: str) -> List[str]:
     Production chunking blocks:
     - Split on blank lines
     - Start new block on headings
-    - Keep tables/lists as their own blocks and do not merge into narrative text
+    - Keep tables/lists as their own blocks; do not mix with narrative text
     - Prevent mode mixing: narrative vs list/table
     """
     t = _clean_text(text)
@@ -117,7 +168,7 @@ def _split_into_blocks(text: str) -> List[str]:
     blocks: List[str] = []
     buf: List[str] = []
 
-    def flush():
+    def flush() -> None:
         nonlocal buf
         if not buf:
             return
@@ -156,29 +207,118 @@ def _split_into_blocks(text: str) -> List[str]:
         buf.append(raw)
 
     flush()
-
     return blocks if blocks else [t]
 
 
-def _trim_overlap_to_boundary(tail: str) -> str:
+def _is_mid_word_boundary(s: str) -> bool:
     """
-    Make overlap start at a clean boundary to avoid mid-word stitching.
-    We drop leading partial tokens until first whitespace/punctuation boundary.
+    Detect if a string likely starts mid-word (bad overlap stitch).
+    Conservative: only for latin/urdu letters/digits at start and no boundary early.
     """
-    s = (tail or "").strip()
     if not s:
+        return False
+    s = s.lstrip()
+    if not s:
+        return False
+
+    # if starts with punctuation or newline, it's safe
+    if re.match(r"^[\s\.\,\;\:\!\?\)\]\}\"\']+", s):
+        return False
+
+    # if starts with a letter/digit and the first 12 chars contain no whitespace/punct, likely mid-token
+    head = s[:12]
+    if re.match(r"^[A-Za-z\u0600-\u06FF0-9]+$", head):
+        return True
+    return False
+
+
+def _safe_overlap_tail(prev: str, cap: int) -> str:
+    """
+    Compute a safe overlap tail:
+    - avoid structured tails
+    - avoid mid-word starts
+    - try to begin at a sentence boundary when possible
+    """
+    if not prev:
+        return ""
+    prev = prev.strip()
+    if not prev:
         return ""
 
-    # If it starts mid-word, remove the partial word prefix
-    # Example: "ulatory Authority ..." -> remove "ulatory"
-    if re.match(r"^[A-Za-z\u0600-\u06FF0-9]+", s):
-        # find first boundary (space or punctuation) AFTER some chars
-        m = re.search(r"[\s\.,;:\)\]\}!\?]", s)
-        if m and m.start() < 20:
-            s = s[m.start():].lstrip()
+    # If previous chunk is mostly structured, skip overlap entirely (it harms tables/lists)
+    lines = prev.split("\n")
+    structured_lines = sum(1 for ln in lines if _looks_like_table_or_list(ln.strip()))
+    if lines and structured_lines / max(1, len(lines)) >= 0.60:
+        return ""
 
-    # keep it reasonably short and clean
-    return s.strip()
+    cap = max(60, min(int(cap or 0), 700))
+    tail = prev[-cap:].strip()
+    if not tail:
+        return ""
+
+    # Prefer sentence boundary: find last boundary inside tail and start there
+    m = None
+    for m in _SENT_BOUNDARY_RE.finditer(tail):
+        pass
+    if m is not None:
+        cut = m.end()
+        candidate = tail[cut:].strip()
+        if candidate and len(candidate) >= 40:
+            tail = candidate
+
+    # If tail starts mid-word, drop until a boundary
+    if _is_mid_word_boundary(tail):
+        b = re.search(r"[\s\.,;:\)\]\}!\?\u06D4\u061F]", tail)
+        if b and b.start() < 25:
+            tail = tail[b.start():].strip()
+
+    # keep only if still meaningful
+    if len(tail) < 40:
+        return ""
+    return tail
+
+
+def _split_huge_block_soft(text: str, max_chars: int, overlap_chars: int) -> List[str]:
+    """
+    Split a huge block into parts, preferring boundaries (newline/sentence),
+    rather than raw character slicing.
+    """
+    t = _clean_text(text)
+    if not t:
+        return []
+
+    parts: List[str] = []
+    step = max(200, max_chars - max(0, overlap_chars))
+
+    start = 0
+    while start < len(t):
+        end = min(len(t), start + max_chars)
+        window = t[start:end]
+
+        # try to break on newline near the end
+        if end < len(t):
+            nl = window.rfind("\n")
+            if nl >= int(0.65 * len(window)):
+                end = start + nl
+
+        # try to break on sentence boundary near the end (if still large)
+        if end < len(t):
+            win2 = t[start:end]
+            last = None
+            for m in _SENT_BOUNDARY_RE.finditer(win2):
+                last = m
+            if last is not None and last.end() >= int(0.70 * len(win2)):
+                end = start + last.end()
+
+        part = _clean_text(t[start:end])
+        if part:
+            parts.append(part)
+
+        if end >= len(t):
+            break
+        start = start + step
+
+    return parts
 
 
 def _chunk_by_char_budget(blocks: List[str], max_chars: int, overlap_chars: int) -> List[str]:
@@ -188,7 +328,7 @@ def _chunk_by_char_budget(blocks: List[str], max_chars: int, overlap_chars: int)
 
     Hardening:
     - Never allow overlap >= max_chars
-    - Safe splitting for huge blocks
+    - Safe splitting for huge blocks using soft boundaries
     - Cap total chunks globally
     """
     if not blocks:
@@ -203,7 +343,7 @@ def _chunk_by_char_budget(blocks: List[str], max_chars: int, overlap_chars: int)
     buf: List[str] = []
     size = 0
 
-    def flush():
+    def flush() -> None:
         nonlocal buf, size
         if not buf:
             return
@@ -220,32 +360,13 @@ def _chunk_by_char_budget(blocks: List[str], max_chars: int, overlap_chars: int)
         if not b:
             continue
 
-        # Huge block safeguard
+        # Huge block safeguard (improved)
         if len(b) > max_chars:
             flush()
-
-            step = max(200, max_chars - overlap_chars)
-            approx = int(len(b) / max_chars) + 5
-            max_parts = max(80, min(3000, approx))
-
-            start = 0
-            parts_made = 0
-            while start < len(b) and parts_made < max_parts:
-                end = min(len(b), start + max_chars)
-                part = _clean_text(b[start:end])
+            parts = _split_huge_block_soft(b, max_chars=max_chars, overlap_chars=overlap_chars)
+            for part in parts:
                 if part:
                     chunks.append(part)
-                    if len(chunks) >= GLOBAL_MAX_CHUNKS:
-                        return chunks
-                parts_made += 1
-                if end >= len(b):
-                    break
-                start = start + step
-
-            if start < len(b):
-                tail = _clean_text(b[-max_chars:])
-                if tail:
-                    chunks.append(tail)
                     if len(chunks) >= GLOBAL_MAX_CHUNKS:
                         return chunks
             continue
@@ -262,10 +383,10 @@ def _chunk_by_char_budget(blocks: List[str], max_chars: int, overlap_chars: int)
 
     flush()
 
-    # Overlap: add tail of previous chunk (clean boundary)
+    # Overlap: add tail of previous chunk (safe boundary)
     if overlap_chars > 0 and len(chunks) > 1:
         out: List[str] = []
-        cap = max(80, min(overlap_chars, 500))  # keep overlap reasonable
+        cap = max(80, min(overlap_chars, 600))
 
         for i, c in enumerate(chunks):
             if i == 0:
@@ -273,8 +394,7 @@ def _chunk_by_char_budget(blocks: List[str], max_chars: int, overlap_chars: int)
                 continue
 
             prev = chunks[i - 1]
-            tail = prev[-cap:]
-            tail = _trim_overlap_to_boundary(tail)
+            tail = _safe_overlap_tail(prev, cap=cap)
 
             if tail:
                 stitched = _clean_text(tail + "\n\n" + c)
@@ -282,6 +402,7 @@ def _chunk_by_char_budget(blocks: List[str], max_chars: int, overlap_chars: int)
                 stitched = _clean_text(c)
 
             out.append(stitched)
+
         return out
 
     return chunks
@@ -292,16 +413,39 @@ def _force_keep_chunk(ctext: str) -> bool:
     Some chunks must be kept even if short, because they answer common questions.
     """
     t = (ctext or "").lower()
+
+    # Schedules/Annexures
     if "schedule" in t or "annex" in t or "annexure" in t or "appendix" in t:
         return True
+
+    # PERA identity / short definition-like
     if "punjab enforcement and regulatory authority" in t or re.search(r"\bpera\b", t):
-        if len(t) < 500:
+        if len(t) < 700:
             return True
+
+    # Roles / org
     if "chief technology officer" in t or re.search(r"\bcto\b", t):
         return True
+
+    # TOR
     if "terms of reference" in t or re.search(r"\btor\b", t):
         return True
+
+    # definition patterns
+    if re.search(r"\bmeans\b", t) and len(t) < 900:
+        return True
+    if re.search(r"^\s*definition(s)?\b", t) and len(t) < 1200:
+        return True
+
+    # Urdu definition-ish: "مراد" / "سے مراد"
+    if ("سے مراد" in ctext) or ("مراد" in ctext and len(ctext) < 900):
+        return True
+
     return False
+
+
+def _count_real_words(s: str) -> int:
+    return len(re.findall(r"[A-Za-z\u0600-\u06FF]{3,}", s or ""))
 
 
 # -----------------------------
@@ -351,7 +495,6 @@ def chunk_units(
 
         blocks = _split_into_blocks(txt)
         chunk_texts = _chunk_by_char_budget(blocks, max_chars=max_chars, overlap_chars=overlap_chars)
-
         if not chunk_texts:
             chunk_texts = [txt]
 
@@ -367,7 +510,7 @@ def chunk_units(
                     pass
                 elif i == len(chunk_texts) - 1:
                     # allow last tail only if it has enough real words
-                    if len(re.findall(r"[A-Za-z\u0600-\u06FF]{3,}", ctext)) >= 10:
+                    if _count_real_words(ctext) >= 10:
                         pass
                     else:
                         continue

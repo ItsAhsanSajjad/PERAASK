@@ -34,19 +34,20 @@ class ExtractedUnit:
 SUPPORTED_EXTS = (".pdf", ".docx")
 
 _NUL_RE = re.compile(r"\x00+")
-# common garbage from PDF extraction
 _PAGE_NUM_RE = re.compile(r"^\s*(page\s*)?\d+\s*(of\s*\d+)?\s*$", re.I)
-
-# Keep Urdu/Arabic block characters; do not destroy them during cleaning
 _MULTI_NEWLINES_RE = re.compile(r"\n{4,}")
 
-# Bullet patterns
 _BULLET_RE = re.compile(r"^\s*([•\-\u2022]|\d+[\)\.]|[A-Za-z][\)\.])\s+")
-# Detect tabular alignment (raw, before whitespace collapsing)
 _TABLE_LIKE_RE = re.compile(r"(\t+|\s{2,})")
-
-# Hyphenation: join "regula-" + "tory" (very common in PDFs)
 _HYPHEN_END_RE = re.compile(r".*[\w\u0600-\u06FF]-$")
+
+# Useful heading-ish keywords (English + common legal doc markers)
+_HEADING_KEYWORDS_RE = re.compile(
+    r"^\s*(schedule|annex|annexure|appendix|chapter|section|part|rule|rules|procedure|definitions?)\b",
+    re.I
+)
+
+_ALLCAPS_WORDS_RE = re.compile(r"^[A-Z0-9\s\-\–—_:;,/\\\.\(\)\[\]]{4,}$")
 
 
 def _clean_text_general(s: str) -> str:
@@ -59,16 +60,54 @@ def _clean_text_general(s: str) -> str:
     s = _NUL_RE.sub(" ", s)
     s = s.replace("\r\n", "\n").replace("\r", "\n")
     s = _MULTI_NEWLINES_RE.sub("\n\n\n", s)
-    # Trim each line but preserve line boundaries
     s = "\n".join([ln.strip() for ln in s.split("\n")])
     return s.strip()
 
 
 def _is_heading_style(style_name: str) -> bool:
+    """
+    Robust heading style detection:
+    - Handles "Heading 1", "heading 2", "Title", and some localized variations
+    """
     if not style_name:
         return False
     sn = style_name.strip().lower()
-    return sn.startswith("heading")
+    if sn.startswith("heading"):
+        return True
+    if "heading" in sn:
+        return True
+    if sn in ("title", "subtitle"):
+        return True
+    return False
+
+
+def _looks_like_heading_text(txt: str) -> bool:
+    """
+    Fallback heading heuristic when style is not reliable.
+    Conservative (avoid false positives).
+    """
+    t = (txt or "").strip()
+    if not t:
+        return False
+
+    # Strong legal-structure markers
+    if _HEADING_KEYWORDS_RE.search(t):
+        return True
+
+    # Short all-caps headings
+    if len(t) <= 90 and _ALLCAPS_WORDS_RE.match(t):
+        # require some letters to avoid "----"
+        letters = len(re.findall(r"[A-Z]", t))
+        if letters >= 4:
+            return True
+
+    # "X:" style headings (short)
+    if len(t) <= 80 and t.endswith(":"):
+        # require at least one real word
+        if len(re.findall(r"[A-Za-z\u0600-\u06FF]{2,}", t)) >= 1:
+            return True
+
+    return False
 
 
 def discover_documents(data_dir: str = "assets/data") -> List[str]:
@@ -97,17 +136,12 @@ def _pdf_lines_raw(text: str) -> List[str]:
     t = text or ""
     t = _NUL_RE.sub(" ", t)
     t = t.replace("\r\n", "\n").replace("\r", "\n")
-    # do NOT collapse spaces here
     lines = [ln.strip("\n") for ln in t.split("\n")]
     lines = [ln.strip() for ln in lines if ln and ln.strip()]
     return lines
 
 
 def _normalize_line_for_header_footer(line: str) -> str:
-    """
-    Normalize digits so "Page 12" ~= "Page 03".
-    Also normalize whitespace so positional repetition can be detected.
-    """
     l = (line or "").strip().lower()
     l = re.sub(r"\d+", "0", l)
     l = re.sub(r"\s+", " ", l).strip()
@@ -115,22 +149,18 @@ def _normalize_line_for_header_footer(line: str) -> str:
 
 
 def _is_header_footer_candidate(line: str) -> bool:
-    """
-    Avoid over-stripping: only consider short / low-density lines.
-    """
     s = (line or "").strip()
     if not s:
         return False
     if len(s) > 120:
         return False
-    # page number lines are always candidates
     if _PAGE_NUM_RE.match(s):
         return True
-    # low-content lines: mostly punctuation/digits
+
     letters = len(re.findall(r"[A-Za-z\u0600-\u06FF]", s))
     if letters <= 6:
         return True
-    # common boilerplate header/footer signals
+
     sl = s.lower()
     if "punjab" in sl and ("authority" in sl or "regulatory" in sl or "enforcement" in sl):
         return True
@@ -138,11 +168,6 @@ def _is_header_footer_candidate(line: str) -> bool:
 
 
 def _detect_repeated_header_footer(page_lines: List[List[str]], min_pages: int = 3) -> Dict[str, set]:
-    """
-    Find repeated first/last lines across many pages (headers/footers).
-    Returns {"header": set(lines), "footer": set(lines)} of normalized strings.
-    Conservative: only lines that look like headers/footers are eligible.
-    """
     if len(page_lines) < min_pages:
         return {"header": set(), "footer": set()}
 
@@ -155,7 +180,6 @@ def _detect_repeated_header_footer(page_lines: List[List[str]], min_pages: int =
             continue
         eligible_pages += 1
 
-        # consider first 2 lines, last 2 lines (only if candidate)
         for ln in lines[:2]:
             if not _is_header_footer_candidate(ln):
                 continue
@@ -173,7 +197,7 @@ def _detect_repeated_header_footer(page_lines: List[List[str]], min_pages: int =
     if eligible_pages < min_pages:
         return {"header": set(), "footer": set()}
 
-    threshold = max(2, int(0.60 * eligible_pages))  # more conservative than 50%
+    threshold = max(2, int(0.60 * eligible_pages))
     header = {k for k, c in first_counts.items() if c >= threshold}
     footer = {k for k, c in last_counts.items() if c >= threshold}
     return {"header": header, "footer": footer}
@@ -197,39 +221,27 @@ def _strip_headers_footers(lines: List[str], hf: Dict[str, set]) -> List[str]:
 
 
 def _looks_like_table_row(raw_line: str) -> bool:
-    """
-    Detect table-like lines before whitespace collapse:
-    - contains multiple spaces or tabs
-    - has enough content
-    """
     s = (raw_line or "").rstrip()
     if len(s) < 20:
         return False
     if _TABLE_LIKE_RE.search(s) is None:
         return False
-    # avoid treating normal sentences as tables
     if s.count("  ") >= 1 or "\t" in s:
-        # needs multiple tokens
         tokens = re.findall(r"[A-Za-z\u0600-\u06FF0-9]{2,}", s)
         return len(tokens) >= 3
     return False
 
 
 def _normalize_table_row(raw_line: str) -> str:
-    """
-    Normalize table-like spacing into a stable delimiter.
-    This makes retrieval + grounding stronger than losing column structure.
-    """
     s = (raw_line or "").strip()
     s = re.sub(r"\t+", "  ", s)
-    # Convert 2+ spaces into a visible column delimiter
     s = re.sub(r"\s{2,}", " | ", s).strip()
     return s
 
 
 def _join_pdf_lines(lines: List[str]) -> str:
     """
-    Join PDF-extracted lines into a cleaner text:
+    Join PDF-extracted lines into cleaner text:
     - keep bullets / table-like rows as new lines
     - merge narrative lines into paragraphs
     - fix hyphenated line breaks
@@ -247,51 +259,37 @@ def _join_pdf_lines(lines: List[str]) -> str:
         merged.append(" ".join(buf).strip())
         buf = []
 
-    prev_line_raw: Optional[str] = None
-
     for ln in lines:
         raw = (ln or "").strip()
         if not raw:
             flush_buf()
-            prev_line_raw = None
             continue
 
-        # bullets and tables preserved as their own lines
         if _BULLET_RE.search(raw) is not None:
             flush_buf()
             merged.append(raw)
-            prev_line_raw = raw
             continue
 
         if _looks_like_table_row(raw):
             flush_buf()
             merged.append(_normalize_table_row(raw))
-            prev_line_raw = raw
             continue
 
-        # Hyphenation fix: previous buffer last token ends with '-' and current begins with a word
         if buf:
             prev = buf[-1]
             if _HYPHEN_END_RE.match(prev):
-                # join without space: "regula-" + "tory" => "regulatory"
                 buf[-1] = prev[:-1] + raw
-                prev_line_raw = raw
                 continue
 
-        # Preserve sectioning after colon
         if buf and buf[-1].endswith(":"):
             flush_buf()
             buf.append(raw)
-            prev_line_raw = raw
             continue
 
         buf.append(raw)
-        prev_line_raw = raw
 
     flush_buf()
-
-    text = "\n".join(merged)
-    return _clean_text_general(text)
+    return _clean_text_general("\n".join(merged))
 
 
 # -----------------------------
@@ -315,7 +313,6 @@ def extract_pdf_units(pdf_path: str) -> List[ExtractedUnit]:
     except Exception:
         return units
 
-    # first pass: raw page lines for header/footer detection
     raw_lines_by_page: List[List[str]] = []
     for page in pages:
         try:
@@ -326,20 +323,15 @@ def extract_pdf_units(pdf_path: str) -> List[ExtractedUnit]:
 
     hf = _detect_repeated_header_footer(raw_lines_by_page)
 
-    # second pass: build units
     for i, lines in enumerate(raw_lines_by_page):
         page_no = i + 1
 
         lines2 = _strip_headers_footers(lines, hf)
-
-        # fallback: if we stripped too much, use original lines
         if len(lines2) < max(3, int(0.25 * len(lines))):
             lines2 = lines
 
         text = _join_pdf_lines(lines2)
         text = _clean_text_general(text)
-
-        # keep only meaningful pages
         if not text:
             continue
 
@@ -361,6 +353,41 @@ def extract_pdf_units(pdf_path: str) -> List[ExtractedUnit]:
 # -----------------------------
 # DOCX Extraction
 # -----------------------------
+def _para_is_heading(p) -> bool:
+    """
+    Decide if a docx paragraph is a heading.
+    Uses style first, then a conservative text heuristic.
+    """
+    txt = (getattr(p, "text", "") or "").strip()
+    if not txt:
+        return False
+
+    style_name = ""
+    try:
+        style_name = p.style.name if p.style else ""
+    except Exception:
+        style_name = ""
+
+    if _is_heading_style(style_name):
+        return True
+
+    # fallback heuristic
+    return _looks_like_heading_text(txt)
+
+
+def _format_docx_unit_text(heading: str, body: str) -> str:
+    """
+    IMPORTANT FIX: include heading in the unit text so embeddings capture it.
+    """
+    h = (heading or "").strip()
+    b = (body or "").strip()
+    if h and b:
+        return _clean_text_general(f"{h}\n\n{b}")
+    if h:
+        return _clean_text_general(h)
+    return _clean_text_general(b)
+
+
 def extract_docx_units(
     docx_path: str,
     min_chars_per_unit: int = 800,
@@ -368,6 +395,7 @@ def extract_docx_units(
 ) -> List[ExtractedUnit]:
     """
     Extract DOCX into stable units using headings.
+    FIX: headings are included into text payload so retrieval doesn't miss section titles.
     """
     units: List[ExtractedUnit] = []
     docx_path = (docx_path or "").replace("\\", "/")
@@ -379,115 +407,92 @@ def extract_docx_units(
     except Exception:
         return units
 
-    paras: List[Dict[str, Any]] = []
+    # Build an ordered stream of paragraphs with heading context
+    stream: List[Dict[str, Any]] = []
     para_idx = 0
     current_heading = ""
+
+    # Track heading-only situations
+    last_was_heading = False
 
     for p in doc.paragraphs:
         txt = (p.text or "").strip()
         if not txt:
             continue
 
-        style_name = ""
-        try:
-            style_name = p.style.name if p.style else ""
-        except Exception:
-            style_name = ""
-
-        if _is_heading_style(style_name):
+        if _para_is_heading(p):
             current_heading = txt
+            last_was_heading = True
             continue
 
         para_idx += 1
-        paras.append({
-            "i": para_idx,
-            "heading": current_heading,
-            "text": txt
-        })
+        stream.append({"i": para_idx, "heading": current_heading, "text": txt})
+        last_was_heading = False
 
-    if not paras:
+    # If DOCX had headings but no body paragraphs, keep at least the headings as units (rare but possible)
+    if not stream:
+        # best-effort: add document title-ish headings if present
+        # (we cannot reliably access headings now because we skipped them above)
         return units
 
-    has_any_heading = any(p["heading"] for p in paras)
+    has_any_heading = any((x.get("heading") or "").strip() for x in stream)
 
     if has_any_heading:
-        groups: Dict[str, List[Dict[str, Any]]] = {}
-        for p in paras:
-            h = p["heading"] or "Untitled"
-            groups.setdefault(h, []).append(p)
-
-        for heading, items in groups.items():
-            _emit_docx_group_as_units(
-                units=units,
-                doc_name=doc_name,
-                docx_path=docx_path,
-                heading=heading,
-                items=items,
-                min_chars=min_chars_per_unit,
-                max_chars=max_chars_per_unit
-            )
+        _emit_docx_stream_grouped_by_heading(
+            units=units,
+            doc_name=doc_name,
+            docx_path=docx_path,
+            stream=stream,
+            min_chars=min_chars_per_unit,
+            max_chars=max_chars_per_unit,
+        )
         return units
 
+    # No headings detected: fall back to paragraph blocks
     _emit_docx_paragraph_blocks(
         units=units,
         doc_name=doc_name,
         docx_path=docx_path,
-        items=paras,
+        items=stream,
         min_chars=min_chars_per_unit,
         max_chars=max_chars_per_unit
     )
     return units
 
 
-def _emit_docx_group_as_units(
+def _emit_docx_stream_grouped_by_heading(
     units: List[ExtractedUnit],
     doc_name: str,
     docx_path: str,
-    heading: str,
-    items: List[Dict[str, Any]],
+    stream: List[Dict[str, Any]],
     min_chars: int,
-    max_chars: int
+    max_chars: int,
 ) -> None:
+    """
+    Ordered grouping by heading (do NOT use dict grouping; it destroys order).
+    Each emitted unit includes its heading in the text.
+    """
+    current_heading = ""
     buffer: List[str] = []
-    start_i = None
-    end_i = None
+    start_i: Optional[int] = None
+    end_i: Optional[int] = None
     char_count = 0
 
-    for p in items:
-        txt = p["text"]
-        i = p["i"]
+    def flush() -> None:
+        nonlocal buffer, start_i, end_i, char_count, current_heading
+        if not buffer and not current_heading:
+            return
 
-        if start_i is None:
-            start_i = i
-        end_i = i
+        body = _clean_text_general("\n".join(buffer)) if buffer else ""
+        text = _format_docx_unit_text(current_heading, body)
 
-        buffer.append(txt)
-        char_count += len(txt) + 1
-
-        if char_count >= max_chars:
-            text = _clean_text_general("\n".join(buffer))
-            if text:
-                anchor = f'Section: "{heading}" (Paragraphs {start_i}–{end_i})'
-                units.append(
-                    ExtractedUnit(
-                        doc_name=doc_name,
-                        source_type="docx",
-                        loc_kind="section",
-                        loc_start=anchor,
-                        loc_end=anchor,
-                        text=text,
-                        path=docx_path,
-                    )
-                )
-            buffer = []
-            start_i = None
-            end_i = None
-            char_count = 0
-
-    if buffer:
-        text = _clean_text_general("\n".join(buffer))
         if text:
-            anchor = f'Section: "{heading}" (Paragraphs {start_i}–{end_i})'
+            # Anchor includes paragraph range (when available)
+            if start_i is not None and end_i is not None:
+                anchor = f'Section: "{current_heading or "Untitled"}" (Paragraphs {start_i}–{end_i})'
+            else:
+                anchor = f'Section: "{current_heading or "Untitled"}"'
+
             units.append(
                 ExtractedUnit(
                     doc_name=doc_name,
@@ -500,6 +505,33 @@ def _emit_docx_group_as_units(
                 )
             )
 
+        buffer = []
+        start_i = None
+        end_i = None
+        char_count = 0
+
+    for item in stream:
+        h = (item.get("heading") or "").strip()
+        txt = (item.get("text") or "").strip()
+        i = int(item.get("i") or 0)
+
+        # Heading changed => flush previous section
+        if h != current_heading:
+            flush()
+            current_heading = h
+
+        if start_i is None:
+            start_i = i
+        end_i = i
+
+        buffer.append(txt)
+        char_count += len(txt) + 1
+
+        if char_count >= max_chars:
+            flush()
+
+    flush()
+
 
 def _emit_docx_paragraph_blocks(
     units: List[ExtractedUnit],
@@ -510,13 +542,15 @@ def _emit_docx_paragraph_blocks(
     max_chars: int
 ) -> None:
     buffer: List[str] = []
-    start_i = None
-    end_i = None
+    start_i: Optional[int] = None
+    end_i: Optional[int] = None
     char_count = 0
 
     for p in items:
-        txt = p["text"]
-        i = p["i"]
+        txt = (p.get("text") or "").strip()
+        i = int(p.get("i") or 0)
+        if not txt:
+            continue
 
         if start_i is None:
             start_i = i

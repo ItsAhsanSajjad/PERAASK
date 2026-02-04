@@ -5,6 +5,7 @@ import re
 import json
 import uuid
 import time
+import html
 from datetime import datetime
 from typing import List, Dict, Any, Tuple, Optional
 
@@ -23,7 +24,7 @@ from retriever import retrieve
 from answerer import answer_question
 
 # ✅ Smalltalk / greeting intent layer
-from smalltalk_intent import decide_smalltalk
+from smalltalk_intent import decide_smalltalk, detect_language
 
 
 # ---------------- CONFIG ----------------
@@ -184,7 +185,6 @@ def _save_chat_store(store: Dict[str, Any]) -> None:
         with _FileLock(CHAT_LOCK_PATH, timeout_s=3.0, poll_s=0.05, stale_s=45.0):
             _atomic_write_json(CHATS_STORE_PATH, store)
     except Exception as e:
-        # Do not crash UI; just show warning in debug mode
         if APP_DEBUG:
             st.sidebar.warning(f"Chat store save failed (non-fatal): {e}")
 
@@ -247,6 +247,29 @@ def _update_context_state(ctx: Dict[str, Any], user_text: str) -> Dict[str, Any]
     ctx["recent_user_turns"] = turns[-5:]  # last 5 turns
     return ctx
 
+def _lang_labels(lang: str) -> Dict[str, str]:
+    # smalltalk_intent.detect_language returns: english | urdu | roman_urdu | unsupported
+    if lang == "urdu":
+        return {
+            "ctx_terms": "سیاقی الفاظ",
+            "prev_q": "پچھلا سوال",
+            "follow": "ضمنی سوال",
+            "regarding": "حوالہ",
+        }
+    if lang == "roman_urdu":
+        return {
+            "ctx_terms": "Mozooi alfaaz",
+            "prev_q": "Pichla sawal",
+            "follow": "Follow-up",
+            "regarding": "Hawala",
+        }
+    return {
+        "ctx_terms": "Context terms",
+        "prev_q": "Previous question",
+        "follow": "Follow-up",
+        "regarding": "Regarding",
+    }
+
 def _build_retrieval_query(prompt: str, ctx: Dict[str, Any], is_follow: bool, last_question: str) -> str:
     """
     Deterministic: always add light topic-term hint.
@@ -254,19 +277,21 @@ def _build_retrieval_query(prompt: str, ctx: Dict[str, Any], is_follow: bool, la
     """
     expanded = _expand_abbrev(prompt)
 
-    # keep last 8-10 unique terms max
+    lang = detect_language(expanded)
+    labels = _lang_labels(lang)
+
     topic_terms = (ctx.get("topic_terms") or [])[-10:]
     hint = " ".join(topic_terms).strip()
     if len(hint) > 180:
         hint = hint[:180].rstrip()
 
     if is_follow and last_question:
-        base = _rewrite_followup_to_standalone(expanded, last_question)
+        base = _rewrite_followup_to_standalone(expanded, last_question, lang)
     else:
         base = expanded
 
     if hint:
-        return f"{base}\nContext terms: {hint}"
+        return f"{base}\n{labels['ctx_terms']}: {hint}"
     return base
 
 
@@ -416,11 +441,11 @@ textarea[aria-label="Transcribed text"] {
   width: 100% !important;
   text-align: left !important;
   border-radius: 12px !important;
-  padding: 8px 12px !important;        /* tighter */
+  padding: 8px 12px !important;
   background: rgba(255,255,255,0.12) !important;
   border: 1px solid rgba(255,255,255,0.10) !important;
   font-size: 14px !important;
-  margin: 0 !important;                /* remove extra gaps */
+  margin: 0 !important;
 }
 .chat-item-btn button:hover { background: rgba(255,255,255,0.22) !important; }
 
@@ -463,6 +488,7 @@ def _normalize_assistant_output(raw: Any) -> Tuple[str, List[Dict[str, Any]]]:
         return (raw.get("answer", "") or ""), (raw.get("references", []) or [])
     return str(raw), []
 
+
 def _strip_legacy_refs_from_answer(answer: str) -> str:
     if not answer:
         return answer
@@ -480,6 +506,7 @@ def _strip_legacy_refs_from_answer(answer: str) -> str:
             continue
         out.append(line)
     return "\n".join(out).strip()
+
 
 def _compress_int_ranges(nums: List[int]) -> str:
     if not nums:
@@ -501,6 +528,7 @@ def _compress_int_ranges(nums: List[int]) -> str:
         parts.append(str(a) if a == b else f"{a}–{b}")
     return ", ".join(parts)
 
+
 def _safe_join_base_and_path(base_url: str, path: str) -> str:
     if not path:
         return ""
@@ -511,6 +539,7 @@ def _safe_join_base_and_path(base_url: str, path: str) -> str:
         p = "/" + p
     return f"{base_url}{p}"
 
+
 def _group_references(refs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     grouped: Dict[Tuple[str, str], Dict[str, Any]] = {}
     for r in refs:
@@ -518,6 +547,11 @@ def _group_references(refs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             continue
         doc = (r.get("document") or r.get("doc_name") or "Unknown document").strip()
         path = (r.get("public_path") or r.get("path") or "").strip()
+
+        # ✅ FIX: fallback path when missing
+        if not path:
+            path = f"/assets/data/{doc}"
+
         key = (doc, path)
         g = grouped.get(key)
         if not g:
@@ -559,6 +593,7 @@ def _group_references(refs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     out.sort(key=lambda x: x.get("document", ""))
     return out
 
+
 def _apply_page_anchor_if_missing(open_url: str, pages: List[int]) -> str:
     if not open_url:
         return open_url
@@ -568,6 +603,7 @@ def _apply_page_anchor_if_missing(open_url: str, pages: List[int]) -> str:
         p = min(int(x) for x in pages if isinstance(x, int) or str(x).isdigit())
         return f"{open_url}#page={p}"
     return open_url
+
 
 def _render_references_click_to_open(references: List[Dict[str, Any]]) -> None:
     if not references:
@@ -594,10 +630,14 @@ def _render_references_click_to_open(references: List[Dict[str, Any]]) -> None:
 
         open_url = _apply_page_anchor_if_missing(open_url, pages)
 
+        # ✅ escape values used in HTML
+        safe_href = html.escape(open_url, quote=True)
+        safe_doc = html.escape(doc, quote=False)
+
         st.markdown(
             f"""
             <div class="ref-row">
-              <a class="ref-pill" href="{open_url}" target="_blank" rel="noopener noreferrer">{doc}</a>
+              <a class="ref-pill" href="{safe_href}" target="_blank" rel="noopener noreferrer">{safe_doc}</a>
             </div>
             """,
             unsafe_allow_html=True,
@@ -613,10 +653,12 @@ def _render_references_click_to_open(references: List[Dict[str, Any]]) -> None:
             meta_lines.append(f"Sections / Paragraphs: {joined}")
 
         if meta_lines:
+            safe_meta = "<br/>".join(html.escape(x) for x in meta_lines)
             st.markdown(
-                f"<div class='ref-meta'>{'<br/>'.join(meta_lines)}</div>",
+                f"<div class='ref-meta'>{safe_meta}</div>",
                 unsafe_allow_html=True,
             )
+
 
 def _render_assistant_message(answer: str, references: List[Dict[str, Any]]) -> None:
     st.markdown(answer)
@@ -641,14 +683,18 @@ def _is_followup(text: str) -> bool:
             return True
     return short_bias and any(w in t for w in ["it", "this", "that", "explain", "simpler", "simple", "clarify"])
 
-def _rewrite_followup_to_standalone(followup: str, last_question: str) -> str:
+
+def _rewrite_followup_to_standalone(followup: str, last_question: str, lang: str) -> str:
     f = (followup or "").strip()
     lq = (last_question or "").strip()
     if not lq:
         return f
+
     if len(f.split()) >= 10 or re.search(r"\b(pera|authority|regulation|policy|rule|notification|composition)\b", f, re.I):
         return f
-    return f"Regarding: {lq}\nFollow-up: {f}"
+
+    labels = _lang_labels(lang)
+    return f"{labels['regarding']}: {lq}\n{labels['follow']}: {f}"
 
 
 # ---------------- Cached index (Blue/Green) ----------------
@@ -671,6 +717,15 @@ def _ensure_index_ready() -> Dict[str, Any]:
 _init_chat_state()
 
 
+# ---------------- User-facing network fallback (blame connection) ----------------
+def _network_fallback_text(lang: str) -> str:
+    if lang == "urdu":
+        return "انٹرنیٹ کنکشن سست یا غیر مستحکم لگ رہا ہے۔ براہِ کرم دوبارہ کوشش کریں (ممکن ہو تو Wi-Fi استعمال کریں)۔"
+    if lang == "roman_urdu":
+        return "Internet connection slow ya unstable lag raha hai. Meharbani karke dobara try karein (mumkin ho to Wi-Fi use karein)."
+    return "Your internet connection seems slow or unstable. Please try again (prefer Wi-Fi)."
+
+
 # ---------------- Core handler (ONE SAVE at end) ----------------
 def _handle_user_message(user_raw: str):
     user_raw = (user_raw or "").strip()
@@ -681,31 +736,44 @@ def _handle_user_message(user_raw: str):
     store = st.session_state.chat_store
     chat_obj = _get_active_chat()
 
-    # Update durable context state BEFORE retrieval (in memory)
-    ctx = chat_obj.get("context_state") or _init_context_state()
-    ctx = _update_context_state(ctx, user_raw)
-    chat_obj["context_state"] = ctx
-
-    # Title on first meaningful prompt
+    # Title on first meaningful prompt (keep production behavior)
     if (chat_obj.get("title") or "New chat") == "New chat":
         chat_obj["title"] = _title_from_prompt(user_raw)
 
-    # Append user message (in memory)
+    # Append user message exactly as typed/spoken
     _append_message_mem(chat_obj, "user", user_raw, [])
 
     # Smalltalk gate
     decision = decide_smalltalk(user_raw)
+
+    # Greeting-only
     if decision and getattr(decision, "is_greeting_only", False):
         _append_message_mem(chat_obj, "assistant", (decision.response or "").strip(), [])
         store["chats"][cid] = chat_obj
         _save_chat_store(store)
         return
 
+    # Greeting + question
     prompt = user_raw
-    ack = ""
     if decision and (not getattr(decision, "is_greeting_only", False)) and getattr(decision, "remaining_question", None):
         prompt = (decision.remaining_question or "").strip()
         ack = (getattr(decision, "ack", "") or "").strip()
+        if ack:
+            _append_message_mem(chat_obj, "assistant", ack, [])
+
+    prompt = (prompt or "").strip()
+    if not prompt:
+        store["chats"][cid] = chat_obj
+        _save_chat_store(store)
+        return
+
+    # ✅ context state update uses the REAL prompt
+    ctx = chat_obj.get("context_state") or _init_context_state()
+    ctx = _update_context_state(ctx, prompt)
+    chat_obj["context_state"] = ctx
+
+    lang = detect_language(prompt)
+    labels = _lang_labels(lang)
 
     last_ret = chat_obj.get("last_retrieval")
     last_q = chat_obj.get("last_question")
@@ -713,52 +781,64 @@ def _handle_user_message(user_raw: str):
 
     retrieval_query = _build_retrieval_query(prompt, ctx, is_follow=is_follow, last_question=last_q or "")
 
+    retrieval_used: Dict[str, Any] = {}
+    raw: Any = {"answer": _network_fallback_text(lang), "references": []}
+
+    # ✅ CRITICAL FIX: never allow exceptions to crash Streamlit UI
     with st.spinner("PERA AI is thinking..."):
-        retrieval_used = retrieve(retrieval_query)
+        try:
+            retrieval_used = retrieve(retrieval_query)
 
-        composed_q_for_answerer = prompt
-        if is_follow and last_q:
-            composed_q_for_answerer = f"{prompt}\n\nContext (previous question): {last_q}"
+            composed_q_for_answerer = prompt
+            if is_follow and last_q:
+                composed_q_for_answerer = f"{prompt}\n\n{labels['prev_q']}: {last_q}"
 
-        raw = answer_question(composed_q_for_answerer, retrieval_used)
+            raw = answer_question(composed_q_for_answerer, retrieval_used)
 
-        # Follow-up fallback: if refused but last retrieval had evidence, retry once
-        if (
-            isinstance(raw, dict)
-            and (raw.get("answer") or "").strip() == REFUSAL_TEXT
-            and is_follow
-            and last_ret
-            and isinstance(last_ret, dict)
-            and last_ret.get("has_evidence")
-        ):
-            raw2 = answer_question(composed_q_for_answerer, last_ret)
-            if isinstance(raw2, dict) and (raw2.get("answer") or "").strip() != REFUSAL_TEXT:
-                raw = raw2
-                retrieval_used = last_ret
+            # Follow-up fallback: if refused but last retrieval had evidence, retry once
+            if (
+                isinstance(raw, dict)
+                and (raw.get("answer") or "").strip() == REFUSAL_TEXT
+                and is_follow
+                and last_ret
+                and isinstance(last_ret, dict)
+                and last_ret.get("has_evidence")
+            ):
+                raw2 = answer_question(composed_q_for_answerer, last_ret)
+                if isinstance(raw2, dict) and (raw2.get("answer") or "").strip() != REFUSAL_TEXT:
+                    raw = raw2
+                    retrieval_used = last_ret
+
+        except Exception as e:
+            # show friendly message (user-side network) and optionally log debug
+            raw = {"answer": _network_fallback_text(lang), "references": []}
+            if APP_DEBUG:
+                with st.sidebar:
+                    st.markdown("---")
+                    st.markdown("### 🛠 Debug (Exception)")
+                    st.write({"error": str(e)[:500], "prompt": prompt, "retrieval_query": retrieval_query})
 
     answer, refs = _normalize_assistant_output(raw)
-    final_answer = f"{ack} {answer}".strip() if ack else answer
-    final_answer = _strip_legacy_refs_from_answer(final_answer)
+    final_answer = _strip_legacy_refs_from_answer(answer)
 
     _append_message_mem(chat_obj, "assistant", final_answer, refs)
 
-    # Update per-chat follow-up context
+    # Update follow-up context ONLY when retrieval has evidence
     if isinstance(retrieval_used, dict) and retrieval_used.get("has_evidence"):
         chat_obj["last_question"] = prompt
         chat_obj["last_retrieval"] = retrieval_used
         chat_obj["last_answer"] = answer
 
-    # Persist ONCE
+    # Persist once
     store["chats"][cid] = chat_obj
     st.session_state.chat_store = store
     _save_chat_store(store)
 
-    # Debug info (optional)
     if APP_DEBUG:
         with st.sidebar:
             st.markdown("---")
             st.markdown("### 🛠 Debug")
-            st.write({"prompt": prompt, "is_follow": is_follow})
+            st.write({"prompt": prompt, "detected_lang": lang, "is_follow": is_follow})
             st.write({"retrieval_query": retrieval_query})
             if isinstance(retrieval_used, dict):
                 st.write({
@@ -778,7 +858,6 @@ with st.sidebar:
         st.session_state.active_chat_id = _create_new_chat(store)
         st.rerun()
 
-    # ✅ NEW: Clear chat history button (below New Chat)
     if st.button("🧹 Clear Chat History", use_container_width=True):
         _clear_all_chats_and_start_fresh()
         st.rerun()
@@ -788,7 +867,6 @@ with st.sidebar:
 
     store = st.session_state.chat_store
 
-    # ✅ wrapper to apply compact spacing CSS
     st.markdown("<div class='chat-list'>", unsafe_allow_html=True)
 
     for chat_id in store.get("order", []):

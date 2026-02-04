@@ -1,57 +1,93 @@
 from __future__ import annotations
 
+import os
 import re
 from dataclasses import dataclass
-from typing import Optional, Tuple
-
+from typing import Optional, Tuple, List
 
 # ----------------------------
-# Language detection (simple + deterministic)
+# Strict language detection (deterministic)
+# Supported: english | urdu | roman_urdu | unsupported
 # ----------------------------
 
-DEVANAGARI_RE = re.compile(r"[\u0900-\u097F]")   # Hindi/Devanagari (unsupported)
-URDU_ARABIC_RE = re.compile(r"[\u0600-\u06FF]")  # Urdu/Arabic script
+_OTHER_SCRIPT_RE = re.compile(
+    r"[\u0900-\u097F"  # Devanagari
+    r"\u0400-\u04FF"   # Cyrillic
+    r"\u4E00-\u9FFF"   # CJK
+    r"\u3040-\u30FF"   # Japanese
+    r"\u0E00-\u0E7F"   # Thai
+    r"\u1100-\u11FF"   # Hangul Jamo
+    r"\uAC00-\uD7AF"   # Hangul syllables
+    r"]"
+)
 
+_ARABIC_SCRIPT_RE = re.compile(r"[\u0600-\u06FF\u0750-\u077F\u08A0-\u08FF]")
+
+_URDU_LETTERS = set("پچڈڑژگںھٰٖؐؑؒؓؔؕٔۍۓۓی")
+_URDU_SPECIFIC_RE = re.compile("[" + re.escape("".join(_URDU_LETTERS)) + "]")
+
+_ROMAN_URDU_HINTS = {
+    "aoa", "a.o.a", "assalam", "assalamu", "asalam", "salam", "salaam", "slm",
+    "ap", "aap", "kya", "ky", "ka", "ki", "ke", "ko", "se", "par", "aur", "ya",
+    "kaise", "kaisay", "kesy", "kese",
+    "hain", "hai", "theek", "thik",
+    "shukriya", "jazakallah",
+    "haal", "hal",
+    "meharbani", "plz", "please",
+    "ji", "haan", "han", "nahi",
+}
+
+_EN_STOPWORDS = {
+    "the", "and", "or", "of", "to", "in", "is", "are", "was", "were", "be", "been",
+    "for", "with", "on", "as", "by", "at", "from", "that", "this", "it", "you", "your",
+    "can", "will", "should", "what", "how", "when", "where", "why", "a", "an"
+}
+
+def _tokenize_latin_words(s: str) -> List[str]:
+    return re.findall(r"[a-zA-Z']+", (s or "").lower())
 
 def detect_language(text: str) -> str:
     """
     Returns: "english" | "urdu" | "roman_urdu" | "unsupported"
     """
-    if DEVANAGARI_RE.search(text or ""):
+    s = (text or "").strip()
+    if not s:
+        return "english"
+
+    if _OTHER_SCRIPT_RE.search(s):
         return "unsupported"
-    if URDU_ARABIC_RE.search(text or ""):
-        return "urdu"
 
-    t = (text or "").lower()
+    if _ARABIC_SCRIPT_RE.search(s):
+        if _URDU_SPECIFIC_RE.search(s):
+            return "urdu"
+        return "unsupported"
 
-    # Roman Urdu markers (deterministic heuristic)
-    roman_markers = [
-        "aoa", "a.o.a", "assalam", "salam", "salaam", "slm",
-        "ap", "aap", "kya", "kaise", "kaisay", "kesy", "kese",
-        "hain", "hai", "theek", "thik", "shukriya", "jazakallah",
-        "haal", "hal"
-    ]
-    if any(re.search(rf"\b{re.escape(m)}\b", t) for m in roman_markers):
+    tokens = _tokenize_latin_words(s)
+    if not tokens:
+        return "english"
+
+    roman_hits = sum(1 for t in tokens if t in _ROMAN_URDU_HINTS)
+    en_hits = sum(1 for t in tokens if t in _EN_STOPWORDS)
+
+    if roman_hits >= 1 and (roman_hits >= en_hits or roman_hits >= 2):
         return "roman_urdu"
 
     return "english"
 
-
 # ----------------------------
 # Normalize for latin matching
 # ----------------------------
-
 def _norm_latin(s: str) -> str:
     s = (s or "").lower()
     s = re.sub(r"[^a-z0-9\s\.\-']", " ", s)
     s = re.sub(r"\s+", " ", s).strip()
     return s
 
-
 # ----------------------------
 # Greeting / smalltalk patterns
 # ----------------------------
 
+# Anchored patterns (start-of-string)
 _GREETING_PATTERNS_LATIN = [
     r"^(hi|hello|hey|hy)\b",
     r"^(aoa|a\.o\.a|assalam|assalamu|asalam|salam|salaam|slm)\b",
@@ -68,130 +104,139 @@ _SMALLTALK_PATTERNS_LATIN = [
 _GREETING_PATTERNS_URDU = [
     r"^(السلام\s*علیکم|اسلام\s*علیکم|سلام)\b",
 ]
+
 _SMALLTALK_PATTERNS_URDU = [
     r"^(آپ\s*کیسے\s*ہیں|آپ\s*کیسی\s*ہیں|کیا\s*حال\s*ہے|کیا\s*حال)\b",
+    r"^(کیسے\s*ہو|کیسا\s*ہے|کیسی\s*ہو)\b",
+    r"^(آپ\s*ٹھیک\s*ہیں|آپ\s*خیریت\s*سے\s*ہیں)\b",
     r"^(شکریہ|جزاک\s*اللہ)\b",
 ]
 
-
-def _starts_with_any(patterns: list[str], text: str) -> bool:
+def _starts_with_any(patterns: List[str], text: str) -> bool:
     for p in patterns:
         if re.search(p, text):
             return True
     return False
 
-
 def is_smalltalk_or_greeting(text: str) -> bool:
     """
-    True if the message (or a remaining fragment) is greeting/smalltalk.
-    Deterministic. No LLM.
+    True if the message looks like greeting/smalltalk ONLY.
+    IMPORTANT: This should NOT swallow greeting+question.
     """
     raw = (text or "").strip()
     if not raw:
         return False
 
-    # Urdu script
-    if URDU_ARABIC_RE.search(raw):
-        r = raw.strip()
-        return _starts_with_any(_GREETING_PATTERNS_URDU + _SMALLTALK_PATTERNS_URDU, r)
+    # Urdu
+    if _ARABIC_SCRIPT_RE.search(raw) and _URDU_SPECIFIC_RE.search(raw):
+        return _starts_with_any(_GREETING_PATTERNS_URDU + _SMALLTALK_PATTERNS_URDU, raw.strip())
 
-    # Latin/roman/english
+    # Latin
     t = _norm_latin(raw)
     return _starts_with_any(_GREETING_PATTERNS_LATIN + _SMALLTALK_PATTERNS_LATIN, t)
 
-
 def is_greeting_prefix(text: str) -> bool:
-    """
-    True if the message starts with a greeting token (not necessarily smalltalk-only).
-    """
     raw = (text or "").strip()
     if not raw:
         return False
 
-    if URDU_ARABIC_RE.search(raw):
+    if _ARABIC_SCRIPT_RE.search(raw) and _URDU_SPECIFIC_RE.search(raw):
         return _starts_with_any(_GREETING_PATTERNS_URDU, raw.strip())
 
     t = _norm_latin(raw)
     return _starts_with_any(_GREETING_PATTERNS_LATIN, t)
 
-
 # ----------------------------
-# Greeting + question split
+# Greeting + question split (RAW, deterministic)
 # ----------------------------
 
 @dataclass
 class SmalltalkDecision:
     is_greeting_only: bool
-    ack: str                # brief greeting acknowledgment (for greet+question)
-    response: str           # full deterministic response (for greeting-only)
-    remaining_question: str # if greet+question, this is the question
+    ack: str
+    response: str
+    remaining_question: str
     language: str
 
+_GREET_PREFIX_RAW_RE = re.compile(
+    r"^\s*(hi|hello|hey|hy|aoa|a\.o\.a|slm|salam|salaam|assalam|assalamu|asalam|good\s+morning|good\s+afternoon|good\s+evening)\b",
+    re.IGNORECASE,
+)
 
-def split_greeting_and_question(text: str) -> Tuple[bool, str, str]:
+_URDU_GREET_PREFIX_RAW_RE = re.compile(r"^\s*(السلام\s*علیکم|اسلام\s*علیکم|سلام)\b")
+
+def _language_from_greeting_token(token: str) -> Optional[str]:
     """
-    Returns:
-      (has_greeting_prefix, ack, remaining_question)
+    Infer language from the greeting token itself:
+    - Islamic greetings in latin -> roman_urdu
+    - hi/hello/good morning -> english
+    """
+    t = (token or "").lower()
+    if any(x in t for x in ["aoa", "a.o.a", "slm", "salam", "salaam", "assalam", "assalamu", "asalam"]):
+        return "roman_urdu"
+    if any(x in t for x in ["hi", "hello", "hey", "hy", "good morning", "good afternoon", "good evening"]):
+        return "english"
+    return None
 
-    - If no greeting prefix: (False, "", original text)
-    - If greeting only: (True, ack, "")
-    - If greeting + question: (True, ack, question part)
+def split_greeting_and_question(text: str) -> Tuple[bool, str, str, str]:
+    """
+    Returns: (has_greeting_prefix, ack, remaining_question, lang)
+
+    lang selection priority:
+      1) If Urdu script greeting -> urdu
+      2) Else infer from greeting token (roman_urdu vs english)
+      3) Else fallback detect_language(full text)
     """
     raw = (text or "").strip()
     if not raw:
-        return False, "", ""
-
-    lang = detect_language(raw)
+        return False, "", "", "english"
 
     # Urdu greeting prefix
-    if lang == "urdu":
-        m = re.search(r"^(السلام\s*علیکم|اسلام\s*علیکم|سلام)\b", raw)
-        if not m:
-            return False, "", raw
-        remaining = raw[m.end():].lstrip(" ,:-—–\n\t")
+    m_ur = _URDU_GREET_PREFIX_RAW_RE.search(raw)
+    if m_ur:
+        remaining = raw[m_ur.end():].lstrip(" ,:-—–\n\t")
         ack = "وعلیکم السلام! "
-        return True, ack, remaining
+        return True, ack, remaining, "urdu"
 
     # Latin greeting prefix
-    t = _norm_latin(raw)
-    greet_prefix_re = re.compile(
-        r"^(hi|hello|hey|hy|aoa|a\.o\.a|slm|salam|salaam|assalam|assalamu|asalam|good\s+morning|good\s+afternoon|good\s+evening)\b",
-        re.IGNORECASE,
-    )
-    m = greet_prefix_re.search(t)
+    m = _GREET_PREFIX_RAW_RE.search(raw)
     if not m:
-        return False, "", raw
+        return False, "", raw, detect_language(raw)
 
-    first_token = m.group(0)
-    remaining = re.sub(rf"^{re.escape(first_token)}", "", raw, flags=re.IGNORECASE).lstrip(" ,:-—–\n\t")
+    token = (m.group(0) or "").strip()
+    remaining = raw[m.end():].lstrip(" ,:-—–\n\t")
 
-    token = first_token.lower()
-    if any(x in token for x in ["aoa", "a.o.a", "slm", "salam", "salaam", "assalam", "assalamu", "asalam"]):
-        ack = "Wa Alaikum Assalam! "
+    token_lang = _language_from_greeting_token(token)
+    lang = token_lang or detect_language(raw)
+
+    if token_lang == "roman_urdu":
+        ack = "Walikum Assalam! "
     else:
+        # English-style greeting ack
         ack = "Hello! "
 
-    return True, ack, remaining
-
+    return True, ack, remaining, lang
 
 # ----------------------------
 # Deterministic responses (no retrieval)
 # ----------------------------
+SUPPORTED_LANG_REFUSAL = os.getenv(
+    "SUPPORTED_LANG_REFUSAL",
+    "This assistant supports only English, Urdu, and Roman Urdu."
+).strip()
 
 _RESPONSES = {
     "english": "Hello! I am the PERA AI Assistant. How can I help you with PERA-related questions?",
-    "roman_urdu": "Hello! Main PERA AI Assistant hoon. Aap PERA se related sawal pooch sakte hain — main help kar doon ga.",
-    "urdu": "سلام! میں PERA AI Assistant ہوں۔ آپ PERA سے متعلق سوالات پوچھ سکتے ہیں، میں آپ کی رہنمائی کر دوں گا/گی۔",
-    "unsupported": "I currently support only English, Urdu, and Roman Urdu. Please ask in one of these languages.",
+    "roman_urdu": "Assalam-o-Alaikum! Main PERA AI Assistant hoon. Aap PERA se related sawal poochain, main madad kar doon ga.",
+    "urdu": "السلام علیکم! میں PERA AI Assistant ہوں۔ آپ PERA سے متعلق سوالات پوچھیں، میں آپ کی رہنمائی کر دوں گا۔",
+    "unsupported": SUPPORTED_LANG_REFUSAL,
 }
-
 
 def decide_smalltalk(text: str) -> Optional[SmalltalkDecision]:
     """
-    Main entry:
-    - If greeting-only / smalltalk-only -> returns decision with response, is_greeting_only=True
-    - If greeting + real question -> returns decision with ack + remaining_question
-    - Else -> returns None (normal RAG path)
+    - If greeting-only / smalltalk-only -> returns response (is_greeting_only=True)
+    - If greeting + real question -> returns ack + remaining_question (is_greeting_only=False)
+    - Else -> None
     """
     raw = (text or "").strip()
     if not raw:
@@ -203,8 +248,9 @@ def decide_smalltalk(text: str) -> Optional[SmalltalkDecision]:
             language="english",
         )
 
-    lang = detect_language(raw)
-    if lang == "unsupported":
+    # Hard refuse unsupported scripts
+    lang_full = detect_language(raw)
+    if lang_full == "unsupported":
         return SmalltalkDecision(
             is_greeting_only=True,
             ack="",
@@ -213,27 +259,11 @@ def decide_smalltalk(text: str) -> Optional[SmalltalkDecision]:
             language="unsupported",
         )
 
-    has_greet, ack, remaining = split_greeting_and_question(raw)
+    has_greet, ack, remaining, lang = split_greeting_and_question(raw)
 
-    # ✅ CASE A: Entire message is greeting/smalltalk -> deterministic response
-    # Examples: "hi", "hello", "how are you", "aoa", "kya haal", "آپ کیسے ہیں"
-    if is_smalltalk_or_greeting(raw):
-        # If it also has a remaining part after greeting split, check if that remaining is ALSO smalltalk
-        # Example: "hi how are you" / "aoa kya haal" / "السلام علیکم آپ کیسے ہیں"
-        if not remaining or not remaining.strip() or is_smalltalk_or_greeting(remaining.strip()):
-            return SmalltalkDecision(
-                is_greeting_only=True,
-                ack="",
-                response=_RESPONSES.get(lang, _RESPONSES["english"]),
-                remaining_question="",
-                language=lang,
-            )
-
-    # ✅ CASE B: Greeting + real question -> proceed with RAG on remaining
-    # Example: "AOA what is section 3?" -> ack + remaining question
+    # If we have greeting prefix and a meaningful remaining part, send remaining to RAG
     if has_greet and remaining and remaining.strip():
-        # If remaining starts like smalltalk, keep it greeting-only (already handled above),
-        # otherwise treat as real question.
+        # If remaining is NOT smalltalk, it's a real question
         if not is_smalltalk_or_greeting(remaining.strip()):
             return SmalltalkDecision(
                 is_greeting_only=False,
@@ -243,5 +273,14 @@ def decide_smalltalk(text: str) -> Optional[SmalltalkDecision]:
                 language=lang,
             )
 
-    # ✅ CASE C: Non-greeting query -> normal RAG path
+    # Greeting/smalltalk-only -> deterministic response
+    if is_smalltalk_or_greeting(raw):
+        return SmalltalkDecision(
+            is_greeting_only=True,
+            ack="",
+            response=_RESPONSES.get(lang, _RESPONSES["english"]),
+            remaining_question="",
+            language=lang,
+        )
+
     return None

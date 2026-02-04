@@ -50,6 +50,9 @@ EMBED_TEXT_PREVIEW_CHARS = int(os.getenv("EMBED_TEXT_PREVIEW_CHARS", "1200"))
 
 DEBUG = os.getenv("INDEX_STORE_DEBUG", "0").strip() != "0"
 
+# Cold-start safety: if chunks.jsonl missing/empty but faiss exists, we MUST not reuse old faiss
+DELETE_STALE_FAISS_ON_COLD_START = os.getenv("DELETE_STALE_FAISS_ON_COLD_START", "1").strip() != "0"
+
 
 # -----------------------------
 # Helpers: filesystem
@@ -99,15 +102,8 @@ def _safe_default_fs_path(doc_name: str) -> str:
     return os.path.join("assets", "data", doc_name).replace("\\", "/")
 
 def _canonical_public_path(doc_name: str) -> str:
-    # This is what UI/API should use for open_url construction
     dn = (doc_name or "").strip()
     return f"/assets/data/{dn}".replace("\\", "/") if dn else "/assets/data"
-
-def _basename(p: str) -> str:
-    try:
-        return os.path.basename((p or "").replace("\\", "/"))
-    except Exception:
-        return (p or "").split("/")[-1]
 
 def _now() -> int:
     return int(time.time())
@@ -117,7 +113,6 @@ def _now() -> int:
 # FAISS helpers
 # -----------------------------
 def _new_idmap_index(dim: int) -> faiss.Index:
-    # IndexIDMap2 supports remove_ids reliably
     base = faiss.IndexFlatIP(dim)
     return faiss.IndexIDMap2(base)
 
@@ -283,7 +278,6 @@ def _is_low_signal_chunk(txt: str) -> bool:
         return True
     if len(t) <= 16 and _ONLY_NUM_PUNCT_RE.match(t):
         return True
-    # conservative junk filter (avoid dropping valid short definitions)
     if len(t) < 60 and _count_words(t) < 6 and _count_letters(t) < 25:
         return True
     return False
@@ -590,12 +584,24 @@ def scan_and_ingest_if_needed(
     faiss_missing = not os.path.exists(faiss_path)
     cold_start = FORCE_REBUILD_IF_INDEX_MISSING and (faiss_missing or chunks_missing_or_empty)
 
+    # -----------------------------
+    # ✅ FIX 1: Cold-start must NOT reuse old faiss.index
+    # -----------------------------
     idx: Optional[faiss.Index] = None
-    if os.path.exists(faiss_path):
-        try:
-            idx = faiss.read_index(faiss_path)
-        except Exception:
-            idx = None
+    if cold_start:
+        # If we are rebuilding due to missing/empty chunks.jsonl, old faiss.index is unsafe
+        if DELETE_STALE_FAISS_ON_COLD_START and os.path.exists(faiss_path):
+            try:
+                os.remove(faiss_path)
+            except Exception:
+                pass
+        idx = None
+    else:
+        if os.path.exists(faiss_path):
+            try:
+                idx = faiss.read_index(faiss_path)
+            except Exception:
+                idx = None
 
     unchanged: List[Dict[str, Any]] = []
     removed: List[Dict[str, Any]] = []
@@ -663,13 +669,12 @@ def scan_and_ingest_if_needed(
                 start_id = _next_chunk_id(rows)
                 purge_note = "rebuild_due_to_purge_failure"
 
-            # IMPORTANT: persist purge/rebuild immediately
             try:
                 _save_faiss(idx, faiss_path)
             except Exception:
                 pass
 
-    # ✅ Early return ONLY after purge persistence
+    # Early return after purge persistence
     if (not cold_start) and (not new_or_changed) and os.path.exists(faiss_path):
         _rewrite_jsonl(chunks_path, rows)
         with open(manifest_path, "w", encoding="utf-8") as f:
@@ -717,11 +722,19 @@ def scan_and_ingest_if_needed(
         kept_chunks.append(c)
         embed_text_list.append(_build_embed_text_for_chunk(c))
 
-    # If no usable chunks, still persist manifest + rows + (already persisted purge above)
+    # If no usable chunks, persist manifest + rows
     if not embed_text_list:
         _rewrite_jsonl(chunks_path, rows)
         with open(manifest_path, "w", encoding="utf-8") as f:
             json.dump(updated_manifest, f, ensure_ascii=False, indent=2)
+
+        # Ensure faiss exists in a known-safe state on cold start
+        if cold_start and not os.path.exists(faiss_path):
+            try:
+                empty_idx = _new_idmap_index(1)
+                _save_faiss(empty_idx, faiss_path)
+            except Exception:
+                pass
 
         out = {
             "found": len(scanned),
@@ -747,10 +760,17 @@ def scan_and_ingest_if_needed(
     if idx is None:
         idx = _load_or_create_faiss(faiss_path, dim)
 
-    # Dimension mismatch safety
+    # -----------------------------
+    # ✅ FIX 2: Dim mismatch must rebuild to the CORRECT dim, not dim=1 empty index
+    # -----------------------------
     if getattr(idx, "d", None) != dim:
-        rebuilt = rebuild_index_from_chunks(index_dir=index_dir)
-        idx = rebuilt["index"]
+        # If the stored faiss index is wrong dim, replace it with a fresh one at correct dim
+        idx = _new_idmap_index(dim)
+        try:
+            _save_faiss(idx, faiss_path)
+        except Exception:
+            pass
+        # ids are based on existing rows (rows may be empty on cold start, that's OK)
         rows = _read_jsonl(chunks_path)
         start_id = _next_chunk_id(rows)
 
@@ -767,16 +787,13 @@ def scan_and_ingest_if_needed(
             continue
 
         doc_name = getattr(ch, "doc_name", "Unknown document")
-        # Reference integrity: always canonical for serving
         public_path = _canonical_public_path(doc_name)
 
-        # Keep raw fs path only for internal debug/tracing
         raw_fs_path = (getattr(ch, "path", "") or "").strip()
         if not raw_fs_path:
             raw_fs_path = _safe_default_fs_path(doc_name)
         raw_fs_path = raw_fs_path.replace("\\", "/")
 
-        # Normalize loc fields for reference correctness
         loc_kind = getattr(ch, "loc_kind", "") or ""
         loc_start = getattr(ch, "loc_start", None)
         loc_end = getattr(ch, "loc_end", None)
@@ -804,12 +821,9 @@ def scan_and_ingest_if_needed(
             "loc_start": loc_start,
             "loc_end": loc_end,
 
-            # ✅ Canonical path used by UI/API
             "public_path": public_path,
-            # optional: raw path for debugging only
             "path": raw_fs_path,
 
-            # Evidence payload
             "text": t,
             "text_sha256": _sha256_text(t),
             "text_clean_sha256": _sha256_text(re.sub(r"\s+", " ", t).strip()),
@@ -855,7 +869,7 @@ def scan_and_ingest_if_needed(
 def rebuild_index_from_chunks(index_dir: str = "assets/index") -> Dict[str, Any]:
     """
     Full rebuild from chunks.jsonl active rows.
-    This is the safety hatch when purge is not supported or dim mismatch occurs.
+    Safety hatch when purge is not supported or dim mismatch occurs.
     """
     faiss_path = _p(index_dir, "faiss.index")
     chunks_path = _p(index_dir, "chunks.jsonl")
@@ -885,7 +899,6 @@ def rebuild_index_from_chunks(index_dir: str = "assets/index") -> Dict[str, Any]
 
     changed = False
     for r, et in zip(active, embed_texts_list):
-        # Keep metadata aligned for audit + future diffing
         if (r.get("embedding_model") or "").strip() != EMBEDDING_MODEL:
             r["embedding_model"] = EMBEDDING_MODEL
             changed = True
@@ -909,7 +922,6 @@ def rebuild_index_from_chunks(index_dir: str = "assets/index") -> Dict[str, Any]
             r["search_text"] = stxt
             changed = True
 
-        # Ensure canonical public_path exists (reference correctness)
         dn = (r.get("doc_name") or "").strip()
         if dn and not (r.get("public_path") or "").startswith("/assets/data/"):
             r["public_path"] = _canonical_public_path(dn)

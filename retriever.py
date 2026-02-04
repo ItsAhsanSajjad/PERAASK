@@ -3,14 +3,38 @@ from __future__ import annotations
 import os
 import re
 import json
+import time
+import random
 from typing import List, Dict, Any, Optional, Tuple
 from collections import defaultdict
+from urllib.parse import quote
 
 from dotenv import load_dotenv
 load_dotenv()
 
+# Index + embeddings
+from index_store import load_index_and_chunks, embed_texts, _normalize_vectors, rebuild_index_from_chunks
+
+# ✅ Consistent language detection
+# Returns: "english" | "urdu" | "roman_urdu" | "unsupported"
+from smalltalk_intent import detect_language
+
+# Optional OpenAI for LLM rewrite (best-effort only)
 from openai import OpenAI
-from index_store import load_index_and_chunks, embed_texts, _normalize_vectors
+try:
+    from openai import (
+        APITimeoutError,
+        APIConnectionError,
+        RateLimitError,
+        InternalServerError,
+        APIStatusError,
+    )
+except Exception:  # pragma: no cover
+    APITimeoutError = Exception
+    APIConnectionError = Exception
+    RateLimitError = Exception
+    InternalServerError = Exception
+    APIStatusError = Exception
 
 
 # =============================================================================
@@ -36,7 +60,7 @@ _ACTIVE_POINTER = ActiveIndexPointer(os.getenv("INDEX_POINTER_PATH", "assets/ind
 
 
 def _dir_has_index_files(p: str) -> bool:
-    """Directory is 'usable index' if it has faiss.index and non-empty chunks.jsonl."""
+    """Usable index dir if it has faiss.index and non-empty chunks.jsonl."""
     try:
         if not p or not os.path.isdir(p):
             return False
@@ -80,18 +104,15 @@ def _resolve_index_dir(index_dir: Optional[str]) -> str:
 # =============================================================================
 TOP_K = int(os.getenv("RETRIEVER_TOP_K", "40"))
 
-# Primary threshold: used when we have decent semantic signal
 SIM_THRESHOLD = float(os.getenv("RETRIEVER_SIM_THRESHOLD", "0.18"))
 STRONG_SIM_THRESHOLD = float(os.getenv("RETRIEVER_STRONG_SIM_THRESHOLD", "0.26"))
 
-# Adaptive fallback when scores are low (prevents "no answers")
 MIN_SIM_FLOOR = float(os.getenv("RETRIEVER_MIN_SIM_FLOOR", "0.06"))
 FALLBACK_KEEP_TOPN = int(os.getenv("RETRIEVER_FALLBACK_KEEP_TOPN", "14"))
 
 MAX_CHUNKS_PER_DOC = int(os.getenv("RETRIEVER_MAX_CHUNKS_PER_DOC", "6"))
 MAX_DOCS_RETURNED = int(os.getenv("RETRIEVER_MAX_DOCS_RETURNED", "4"))
 
-# Soft gating controls
 KEEP_TOP_SEMANTIC_PER_DOC = int(os.getenv("RETRIEVER_KEEP_TOP_SEMANTIC_PER_DOC", "2"))
 RELATIVE_DOC_SCORE_KEEP = float(os.getenv("RETRIEVER_RELATIVE_DOC_SCORE_KEEP", "0.80"))
 
@@ -105,33 +126,46 @@ LEX_FALLBACK_PER_DOC = int(os.getenv("RETRIEVER_LEX_FALLBACK_PER_DOC", "3"))
 CRITERIA_DOC_PRIORITIZATION = os.getenv("RETRIEVER_CRITERIA_DOC_PRIORITIZATION", "1").strip() != "0"
 CRITERIA_MIN_DOCS = int(os.getenv("RETRIEVER_CRITERIA_MIN_DOCS", "2"))
 
-# Spell correction
 SPELL_CORRECTION_ENABLED = os.getenv("RETRIEVER_SPELL_CORRECTION_ENABLED", "1").strip() != "0"
 SPELL_MAX_TOKEN_FIXES = int(os.getenv("RETRIEVER_SPELL_MAX_TOKEN_FIXES", "2"))
 SPELL_EDIT_DISTANCE = int(os.getenv("RETRIEVER_SPELL_EDIT_DISTANCE", "2"))
 MAX_QUERY_VARIANTS_WITH_SPELL = int(os.getenv("RETRIEVER_MAX_QUERY_VARIANTS_WITH_SPELL", "5"))
 
-# LLM rewrite controls
 LLM_REWRITE_ENABLED = os.getenv("RETRIEVER_LLM_QUERY_REWRITE_ENABLED", "1").strip() != "0"
 LLM_REWRITE_ALWAYS = os.getenv("RETRIEVER_LLM_QUERY_REWRITE_ALWAYS", "1").strip() != "0"
 LLM_REWRITE_MODEL = os.getenv("RETRIEVER_LLM_QUERY_REWRITE_MODEL", "gpt-4.1-mini")
 LLM_REWRITE_MAX = int(os.getenv("RETRIEVER_LLM_QUERY_REWRITE_MAX", "3"))
 
-# Deterministic reranking weights (semantic dominates; lexical stabilizes)
 RERANK_ENABLED = os.getenv("RETRIEVER_RERANK_ENABLED", "1").strip() != "0"
-RERANK_ALPHA = float(os.getenv("RETRIEVER_RERANK_ALPHA", "0.75"))  # semantic
-RERANK_BETA = float(os.getenv("RETRIEVER_RERANK_BETA", "0.25"))    # lexical
+RERANK_ALPHA = float(os.getenv("RETRIEVER_RERANK_ALPHA", "0.75"))
+RERANK_BETA = float(os.getenv("RETRIEVER_RERANK_BETA", "0.25"))
 
 DEBUG = os.getenv("RETRIEVER_DEBUG", "0").strip() != "0"
+
+# LLM rewrite: timeout + retries (best effort)
+OPENAI_TIMEOUT_S = float(os.getenv("OPENAI_TIMEOUT_S", "12"))
+OPENAI_MAX_RETRIES = int(os.getenv("OPENAI_MAX_RETRIES", "1"))
+OPENAI_RETRY_BASE_S = float(os.getenv("OPENAI_RETRY_BASE_S", "0.6"))
+OPENAI_RETRY_JITTER_S = float(os.getenv("OPENAI_RETRY_JITTER_S", "0.25"))
+OPENAI_RETRY_MAX_SLEEP_S = float(os.getenv("OPENAI_RETRY_MAX_SLEEP_S", "2.5"))
+
+# Auto repair: rebuild once if FAISS is corrupted / dim mismatch
+AUTO_REBUILD_ON_DIM_MISMATCH = os.getenv("RETRIEVER_AUTO_REBUILD_ON_DIM_MISMATCH", "1").strip() != "0"
+AUTO_REBUILD_ON_EMPTY_FAISS = os.getenv("RETRIEVER_AUTO_REBUILD_ON_EMPTY_FAISS", "1").strip() != "0"
 
 
 # =============================================================================
 # Keyword extraction / normalization
 # =============================================================================
-_STOPWORDS = {
+_STOPWORDS_EN = {
     "the", "a", "an", "is", "are", "was", "were", "to", "of", "and", "or",
     "in", "on", "at", "for", "from", "by", "with", "about", "tell", "me",
     "who", "what", "when", "where", "why", "how", "please",
+}
+
+_STOPWORDS_RU = {
+    "mein", "me", "ki", "ka", "ke", "ko", "se", "par", "aur", "ya", "hai", "hain",
+    "tha", "thi", "thay", "kya", "ky", "kyun", "q", "plz", "please",
 }
 
 _INTENT_STOP = {
@@ -144,7 +178,6 @@ _INTENT_STOP = {
 
 _KEEP_SHORT = {"ai", "ml", "it", "hr", "ppra", "ipo", "cto", "tor", "tors", "dg", "pera", "eo", "io", "sso"}
 
-# ✅ Expanded abbreviations/aliases (your missing production pain points)
 _ABBREV_MAP = {
     "cto": "chief technology officer",
     "tor": "terms of reference",
@@ -156,8 +189,6 @@ _ABBREV_MAP = {
     "dev": "development",
     "sr": "senior",
     "jr": "junior",
-
-    # roles commonly asked in govt org contexts
     "eo": "enforcement officer",
     "io": "investigation officer",
     "sso": "senior staff officer",
@@ -181,9 +212,6 @@ def _expand_abbrev(s: str) -> str:
 
 
 def _normalize_text(s: str) -> str:
-    """
-    Keep Urdu/Arabic script. Normalize punctuation away for matching.
-    """
     s = _expand_abbrev(s or "")
     s = s.lower()
     s = re.sub(r"[^a-z0-9\u0600-\u06FF\s]", " ", s)
@@ -214,7 +242,7 @@ def _tokenize_for_overlap(s: str) -> List[str]:
     for raw in q.split():
         if not raw:
             continue
-        if raw in _STOPWORDS:
+        if raw in _STOPWORDS_EN or raw in _STOPWORDS_RU:
             continue
         if len(raw) >= 3 or raw in _KEEP_SHORT:
             toks.append(_stem_token(raw))
@@ -270,6 +298,13 @@ def _rows_by_id(rows: List[Dict[str, Any]]) -> Dict[int, Dict[str, Any]]:
     return out
 
 
+def _safe_int(x: Any, default: int = 0) -> int:
+    try:
+        return int(x)
+    except Exception:
+        return default
+
+
 def _load_index_rows(index_dir: str):
     """
     Robust against load_index_and_chunks returning:
@@ -289,12 +324,20 @@ def _load_index_rows(index_dir: str):
 
 
 # =============================================================================
-# Query type detection (tightened)
+# Query type detection (improved for Urdu/Roman Urdu)
 # =============================================================================
-# ✅ Don’t trigger schedule mode just because a digit exists.
-_SCHEDULE_PAT = re.compile(r"\b(schedule|scheduled\s+laws|annex(ure)?|appendix)\b", re.I)
+_SCHEDULE_PAT = re.compile(r"\b(schedule|scheduled\s+laws|annex(ure)?|appendix|shedule)\b|شیڈول|ضمیمہ", re.I)
 _YESNO_PAT = re.compile(r"^(is|are|was|were|do|does|did|can|could|should|will|would|has|have|had)\b", re.I)
-_DEF_PAT = re.compile(r"^(what\s+is|define|meaning\s+of)\b|(\bwhat\s+is\b.*\bpera\b)", re.I)
+# roman urdu yes/no starters
+_YESNO_RU_PAT = re.compile(r"^(kya|kia|kyaa|kiya)\b", re.I)
+# urdu yes/no starter
+_YESNO_UR_PAT = re.compile(r"^\s*کیا\b")
+# definition patterns
+_DEF_PAT = re.compile(
+    r"^(what\s+is|define|meaning\s+of)\b|(\bwhat\s+is\b.*\bpera\b)|^\s*تعریف\b|^\s*کیا\s+ہے\b|^\s*meaning\b",
+    re.I,
+)
+_DEF_RU_PAT = re.compile(r"^(pera\s+kya\s+hai|meaning\s+of|define)\b", re.I)
 
 def _is_short_query(q: str) -> bool:
     toks = [t for t in _tokenize_for_overlap(q) if t]
@@ -304,10 +347,26 @@ def _is_schedule_query(q: str) -> bool:
     return _SCHEDULE_PAT.search((q or "")) is not None
 
 def _is_yesno_query(q: str) -> bool:
-    return _YESNO_PAT.search((q or "").strip().lower()) is not None
+    s = (q or "").strip()
+    if not s:
+        return False
+    if _YESNO_PAT.search(s.lower()):
+        return True
+    if _YESNO_RU_PAT.search(s):
+        return True
+    if _YESNO_UR_PAT.search(s):
+        return True
+    return False
 
 def _is_definition_query(q: str) -> bool:
-    return _DEF_PAT.search((q or "").strip()) is not None
+    s = (q or "").strip()
+    if not s:
+        return False
+    if _DEF_PAT.search(s):
+        return True
+    if _DEF_RU_PAT.search(s.lower()):
+        return True
+    return False
 
 
 # =============================================================================
@@ -339,8 +398,6 @@ def _build_vocab_from_rows(rows: List[Dict[str, Any]], limit_rows: int = 50000) 
         "terms", "reference", "duties", "responsibilities",
         "manager", "monitoring",
         "schedule", "scheduled", "chairperson", "vice", "secretary",
-
-        # ensure role aliases exist in vocab
         "enforcement", "investigation", "senior", "staff",
     })
     return vocab
@@ -389,7 +446,7 @@ def _spell_correct_query_variant(question: str, vocab: set) -> Optional[str]:
     k = max(1, int(SPELL_EDIT_DISTANCE))
 
     for t in toks:
-        if t.isdigit() or (len(t) < 4 and t not in _KEEP_SHORT) or t in _STOPWORDS or t in _KEEP_SHORT:
+        if t.isdigit() or (len(t) < 4 and t not in _KEEP_SHORT) or t in _STOPWORDS_EN or t in _STOPWORDS_RU or t in _KEEP_SHORT:
             corrected.append(t)
             continue
 
@@ -403,7 +460,6 @@ def _spell_correct_query_variant(question: str, vocab: set) -> Optional[str]:
         best = None
         best_d = k + 1
 
-        # bounded scan: vocab can be huge; first-letter filter keeps it fast
         for w in vocab:
             if not w:
                 continue
@@ -441,11 +497,11 @@ def _spell_correct_query_variant(question: str, vocab: set) -> Optional[str]:
 # =============================================================================
 # Intent patterns + expansions
 # =============================================================================
-_COMPOSITION_PAT = re.compile(r"\b(composition|constitut|constitution|constitute|consist|comprise|members?|authority)\b", re.I)
-_CRITERIA_PAT = re.compile(r"\b(criteria|criterion|eligib|qualification|qualify|required|requirement|experience|education|minimum|degree|age|skills?)\b", re.I)
-_COMPLAINT_PAT = re.compile(r"\b(complaint|complain|grievance|petition|hearing|hearing officer|appeal)\b", re.I)
-_VISION_PAT = re.compile(r"\b(vision|mission|objective|objectives|purpose|aim|aims|mandate)\b", re.I)
-_ROLE_PAT = re.compile(r"\b(role|roles|tor|tors|terms of reference|duty|duties|responsibil|function|job description)\b", re.I)
+_COMPOSITION_PAT = re.compile(r"\b(composition|constitut|constitution|constitute|consist|comprise|members?|authority)\b|تشکیل|اراکین", re.I)
+_CRITERIA_PAT = re.compile(r"\b(criteria|criterion|eligib|qualification|qualify|required|requirement|experience|education|minimum|degree|age|skills?)\b|اہلیت|قابلیت|تعلیم|تجربہ|شرائط", re.I)
+_COMPLAINT_PAT = re.compile(r"\b(complaint|complain|grievance|petition|hearing|hearing officer|appeal)\b|شکایت|درخواست|سماعت", re.I)
+_VISION_PAT = re.compile(r"\b(vision|mission|objective|objectives|purpose|aim|aims|mandate)\b|مقصد|اہداف|فرائض|مینڈیٹ", re.I)
+_ROLE_PAT = re.compile(r"\b(role|roles|tor|tors|terms of reference|duty|duties|responsibil|function|job description)\b|ذمہ\s*داریاں|فرائض|ٹرمز", re.I)
 
 _COMPOSITION_PHRASES = [
     "authority shall consist of",
@@ -489,6 +545,13 @@ _ROLE_PHRASES = [
     "responsibilities include",
     "shall be responsible for",
 ]
+
+_NORM_COMPOSITION_PHRASES = [_normalize_text(x) for x in _COMPOSITION_PHRASES]
+_NORM_CRITERIA_PHRASES = [_normalize_text(x) for x in _CRITERIA_PHRASES]
+_NORM_COMPLAINT_PHRASES = [_normalize_text(x) for x in _COMPLAINT_PHRASES]
+_NORM_VISION_PHRASES = [_normalize_text(x) for x in _VISION_PHRASES]
+_NORM_ROLE_PHRASES = [_normalize_text(x) for x in _ROLE_PHRASES]
+
 
 def _intent_extra_keywords(question: str) -> List[str]:
     q = _normalize_text(question)
@@ -536,49 +599,81 @@ def _build_query_variants(question: str) -> List[str]:
     if not q:
         return [""]
 
+    lang = detect_language(q)
     variants: List[str] = [q]
 
     qn = _normalize_text(q)
     if qn and qn != _normalize_text(variants[0]):
         variants.append(qn)
 
-    # Add PERA context if missing
-    if qn and "pera" not in qn.split():
-        variants.append((q + " in PERA").strip())
+    is_urdu = (lang == "urdu")
+    is_roman = (lang == "roman_urdu")
+    is_en = (lang == "english")
 
-    if "pera" in qn.split() or _is_definition_query(q):
-        variants.append("Punjab Enforcement and Regulatory Authority PERA")
-        variants.append("Punjab Enforcement and Regulation Act PERA")
+    if qn and "pera" not in qn.split():
+        variants.append((q + (" in PERA" if is_en else " PERA")).strip())
+
+    if _is_definition_query(q):
+        if is_urdu:
+            variants.append("پیرا پنجاب انفورسمنٹ اینڈ ریگولیٹری اتھارٹی")
+            variants.append("پنجاب انفورسمنٹ اینڈ ریگولیشن ایکٹ پیرا")
+            variants.append("Punjab Enforcement and Regulatory Authority PERA")
+        elif is_roman:
+            variants.append("PERA Punjab Enforcement and Regulatory Authority")
+            variants.append("Punjab Enforcement and Regulation Act PERA")
+        else:
+            variants.append("Punjab Enforcement and Regulatory Authority PERA")
+            variants.append("Punjab Enforcement and Regulation Act PERA")
 
     if _is_schedule_query(q):
-        variants.append("scheduled laws schedule PERA")
-        variants.append("Schedule II Punjab Enforcement and Regulation Act")
-        variants.append("Schedule III Punjab Enforcement and Regulation Act")
+        variants.append("scheduled laws schedule PERA annexure appendix")
 
-    if _COMPLAINT_PAT.search(qn):
-        variants.append("how can i file a complaint with pera procedure")
-        variants.append("public complaints and hearings hearing officer process")
-    if _VISION_PAT.search(qn):
-        variants.append("purpose objectives functions mandate of pera")
-        variants.append("objects and purposes for which the authority is established")
-    if _ROLE_PAT.search(qn):
-        variants.append("terms of reference duties and responsibilities job description in pera")
+    qnn = _normalize_text(q)
+
+    if _COMPLAINT_PAT.search(qnn):
+        if is_urdu:
+            variants.append("پیرا میں شکایت درج کرنے کا طریقہ")
+            variants.append("شکایات اور سماعت ہیئرنگ آفیسر")
+            variants.append("how can i file a complaint with pera procedure")
+        elif is_roman:
+            variants.append("PERA mein complaint kaise file karen procedure")
+            variants.append("public complaints and hearings hearing officer process")
+        else:
+            variants.append("how can i file a complaint with pera procedure")
+            variants.append("public complaints and hearings hearing officer process")
+
+    if _VISION_PAT.search(qnn):
+        if is_urdu:
+            variants.append("پیرا کا مقصد اہداف افعال مینڈیٹ")
+            variants.append("purpose objectives functions mandate of pera")
+        elif is_roman:
+            variants.append("PERA ka purpose objectives functions mandate")
+            variants.append("purpose objectives functions mandate of pera")
+        else:
+            variants.append("purpose objectives functions mandate of pera")
+            variants.append("objects and purposes for which the authority is established")
+
+    if _ROLE_PAT.search(qnn):
+        if is_urdu:
+            variants.append("ٹرمز آف ریفرنس ذمہ داریاں فرائض")
+            variants.append("terms of reference duties and responsibilities job description in pera")
+        elif is_roman:
+            variants.append("terms of reference duties responsibilities job description PERA")
+        else:
+            variants.append("terms of reference duties and responsibilities job description in pera")
 
     ent = _entity_keywords(q)
     ent_phrase = " ".join(ent[:4]).strip()
 
-    if _COMPOSITION_PAT.search(qn):
+    if _COMPOSITION_PAT.search(qnn):
         variants.append("authority shall consist of the following members chairperson vice chairperson secretary member")
-        variants.append("constitution of the authority members of the authority")
 
-    if _CRITERIA_PAT.search(qn):
+    if _CRITERIA_PAT.search(qnn):
         variants.append(f"{q} eligibility criteria qualification experience")
-        variants.append(f"{q} minimum qualification experience required")
 
-    if _ROLE_PAT.search(qn) and ent_phrase:
+    if _ROLE_PAT.search(qnn) and ent_phrase:
         variants.append(f"terms of reference of {ent_phrase} in PERA")
         variants.append(f"duties and responsibilities of {ent_phrase} in PERA")
-        variants.append(f"job description of {ent_phrase} in PERA")
 
     swapped = _swap_two_word_title(ent[:2])
     if swapped:
@@ -637,7 +732,10 @@ def _definition_lex_fallback(rows: List[Dict[str, Any]]) -> Dict[int, float]:
         "enforcement and regulatory authority",
         " p e r a ",
         " pera ",
+        "پیرا",
+        "اتھارٹی",
     ]
+    norm_phrases = [_normalize_text(x) for x in phrases]
 
     best: Dict[int, float] = {}
     per_doc_counts: Dict[str, int] = defaultdict(int)
@@ -649,17 +747,16 @@ def _definition_lex_fallback(rows: List[Dict[str, Any]]) -> Dict[int, float]:
         if not text:
             continue
 
-        tl = " " + (text or "").lower() + " "
-        if not any(p in tl for p in phrases):
+        tn = _normalize_text(text)
+        if not any(p and p in tn for p in norm_phrases):
             continue
 
         doc_name = r.get("doc_name", "Unknown document")
         if per_doc_counts[doc_name] >= max(1, LEX_FALLBACK_PER_DOC):
             continue
 
-        try:
-            cid = int(r.get("id", r.get("chunk_id")))
-        except Exception:
+        cid = _safe_int(r.get("id", r.get("chunk_id")), -1)
+        if cid < 0:
             continue
 
         best[cid] = max(best.get(cid, 0.0), 0.70)
@@ -691,17 +788,18 @@ def _lexical_fallback_hits(rows: List[Dict[str, Any]], all_keywords: List[str], 
         return {}
 
     if want_schedule:
-        phrases = ["scheduled laws", "schedule", "annex", "appendix", "annexure"]
+        phrases = ["scheduled laws", "schedule", "annex", "appendix", "annexure", "شیڈول", "ضمیمہ"]
+        norm_phrases = [_normalize_text(x) for x in phrases]
     elif want_comp:
-        phrases = _COMPOSITION_PHRASES
+        norm_phrases = _NORM_COMPOSITION_PHRASES + [_normalize_text("authority shall consist"), _normalize_text("اتھارٹی اراکین"), _normalize_text("اتھارٹی تشکیل")]
     elif want_criteria:
-        phrases = _CRITERIA_PHRASES
+        norm_phrases = _NORM_CRITERIA_PHRASES + [_normalize_text("اہلیت"), _normalize_text("تعلیمی قابلیت"), _normalize_text("تجربہ"), _normalize_text("شرائط")]
     elif want_complaint:
-        phrases = _COMPLAINT_PHRASES
+        norm_phrases = _NORM_COMPLAINT_PHRASES + [_normalize_text("شکایت"), _normalize_text("درخواست"), _normalize_text("سماعت")]
     elif want_vision:
-        phrases = _VISION_PHRASES
+        norm_phrases = _NORM_VISION_PHRASES + [_normalize_text("مقاصد"), _normalize_text("اہداف"), _normalize_text("مینڈیٹ")]
     else:
-        phrases = _ROLE_PHRASES
+        norm_phrases = _NORM_ROLE_PHRASES + [_normalize_text("فرائض"), _normalize_text("ذمہ داریاں"), _normalize_text("ٹرمز آف ریفرنس")]
 
     best: Dict[int, float] = {}
     per_doc_counts: Dict[str, int] = defaultdict(int)
@@ -715,7 +813,7 @@ def _lexical_fallback_hits(rows: List[Dict[str, Any]], all_keywords: List[str], 
             continue
 
         tn = _normalize_text(text)
-        phrase_hit = any(p in tn for p in phrases)
+        phrase_hit = any(p and p in tn for p in norm_phrases)
 
         overlap_all = _keyword_overlap_count(all_keywords, text)
         overlap_ent = _keyword_overlap_count(entity_kw, text) if entity_kw else 0
@@ -736,9 +834,8 @@ def _lexical_fallback_hits(rows: List[Dict[str, Any]], all_keywords: List[str], 
         if per_doc_counts[doc_name] >= LEX_FALLBACK_PER_DOC:
             continue
 
-        try:
-            cid = int(r.get("id", r.get("chunk_id")))
-        except Exception:
+        cid = _safe_int(r.get("id", r.get("chunk_id")), -1)
+        if cid < 0:
             continue
 
         pseudo = 0.40 + min(0.28, 0.05 * overlap_all)
@@ -757,13 +854,55 @@ def _lexical_fallback_hits(rows: List[Dict[str, Any]], all_keywords: List[str], 
 
 
 # =============================================================================
-# LLM rewrite (best-effort, never required)
+# LLM rewrite (best-effort, NEVER blocks retrieval)
 # =============================================================================
-def _client() -> OpenAI:
+def _client_optional() -> Optional[OpenAI]:
     key = os.getenv("OPENAI_API_KEY", "").strip()
     if not key:
-        raise RuntimeError("OPENAI_API_KEY is missing. Ensure .env is present and loaded.")
-    return OpenAI(api_key=key)
+        return None
+    try:
+        return OpenAI(api_key=key, timeout=OPENAI_TIMEOUT_S)
+    except Exception:
+        return None
+
+
+def _chat_create_with_retry_optional(
+    client: OpenAI,
+    *,
+    model: str,
+    messages: List[Dict[str, str]],
+    temperature: float = 0.0,
+) -> Optional[str]:
+    for attempt in range(max(0, OPENAI_MAX_RETRIES) + 1):
+        try:
+            resp = client.chat.completions.create(
+                model=model,
+                temperature=temperature,
+                messages=messages,
+                timeout=OPENAI_TIMEOUT_S,
+            )
+            return (resp.choices[0].message.content or "").strip()
+        except (APITimeoutError, APIConnectionError, RateLimitError, InternalServerError):
+            if attempt >= OPENAI_MAX_RETRIES:
+                return None
+            sleep_s = (OPENAI_RETRY_BASE_S * (2 ** attempt)) + random.uniform(0.0, OPENAI_RETRY_JITTER_S)
+            time.sleep(min(OPENAI_RETRY_MAX_SLEEP_S, sleep_s))
+        except APIStatusError as e:
+            sc = getattr(e, "status_code", None)
+            try:
+                sc_i = int(sc) if sc is not None else 0
+            except Exception:
+                sc_i = 0
+            if sc_i == 429 or sc_i >= 500:
+                if attempt >= OPENAI_MAX_RETRIES:
+                    return None
+                sleep_s = (OPENAI_RETRY_BASE_S * (2 ** attempt)) + random.uniform(0.0, OPENAI_RETRY_JITTER_S)
+                time.sleep(min(OPENAI_RETRY_MAX_SLEEP_S, sleep_s))
+                continue
+            return None
+        except Exception:
+            return None
+    return None
 
 
 def _llm_rewrite_queries(question: str) -> List[str]:
@@ -774,6 +913,20 @@ def _llm_rewrite_queries(question: str) -> List[str]:
     if not q:
         return []
 
+    client = _client_optional()
+    if client is None:
+        return []
+
+    lang = detect_language(q)
+
+    lang_rule = (
+        "Language rules:\n"
+        "- Preserve the user's language. DO NOT translate.\n"
+        "- If user is Urdu: keep Urdu script.\n"
+        "- If user is Roman Urdu: use Latin script only.\n"
+        "- If user is English: use English.\n"
+    )
+
     system = (
         "You rewrite user questions into search-friendly queries for a PERA document chatbot.\n"
         "You must NOT answer.\n"
@@ -783,21 +936,22 @@ def _llm_rewrite_queries(question: str) -> List[str]:
         "2) Expand abbreviations: TOR->terms of reference.\n"
         "3) Add 'PERA' context if missing.\n"
         "4) Produce 1-3 short variants maximum.\n"
-        "5) No extra text."
+        "5) No extra text.\n"
+        + lang_rule
     )
 
-    user = f'User question: "{q}"'
+    user = f'User question: "{q}"\nDetected language: {lang}'
 
-    try:
-        resp = _client().chat.completions.create(
-            model=LLM_REWRITE_MODEL,
-            temperature=0.0,
-            messages=[
-                {"role": "system", "content": system},
-                {"role": "user", "content": user},
-            ],
-        ).choices[0].message.content.strip()
-    except Exception:
+    resp = _chat_create_with_retry_optional(
+        client,
+        model=LLM_REWRITE_MODEL,
+        temperature=0.0,
+        messages=[
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ],
+    )
+    if not resp:
         return []
 
     try:
@@ -815,7 +969,7 @@ def _llm_rewrite_queries(question: str) -> List[str]:
 
 
 # =============================================================================
-# Criteria prioritization (kept)
+# Criteria prioritization
 # =============================================================================
 def _criteria_doc_signal_score(doc: Dict[str, Any]) -> float:
     hits = doc.get("hits", []) or []
@@ -823,7 +977,7 @@ def _criteria_doc_signal_score(doc: Dict[str, Any]) -> float:
         return 0.0
     h0 = hits[0]
     txt = _normalize_text(h0.get("text") or "")
-    phrase_hits = sum(1 for p in _CRITERIA_PHRASES if p in txt)
+    phrase_hits = sum(1 for p in _NORM_CRITERIA_PHRASES if p and p in txt)
     score = float(h0.get("score", 0.0) or 0.0)
     overlap = int(h0.get("overlap", 0) or 0)
     return (phrase_hits * 10.0) + (overlap * 1.5) + (score * 1.0)
@@ -861,6 +1015,11 @@ def _canonical_public_path(doc_name: str) -> str:
     return f"/assets/data/{dn}".replace("\\", "/") if dn else "/assets/data"
 
 
+def _quote_path_preserve_slash(p: str) -> str:
+    # quote() default keeps "/" safe, which we want (path segments preserved)
+    return quote((p or "").replace("\\", "/"))
+
+
 def _safe_faiss_k(idx: Any, want_k: int) -> int:
     try:
         ntotal = int(getattr(idx, "ntotal", 0) or 0)
@@ -880,7 +1039,7 @@ def _faiss_dim(idx: Any) -> Optional[int]:
 
 
 # =============================================================================
-# Deterministic reranking (stabilizes phrasing variance)
+# Deterministic reranking
 # =============================================================================
 def _rerank_hits(question: str, hits: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     if not (RERANK_ENABLED and hits):
@@ -895,7 +1054,6 @@ def _rerank_hits(question: str, hits: List[Dict[str, Any]]) -> List[Dict[str, An
         tn = _normalize_text(txt + "\n" + stxt)
         tset = set(tn.split())
         ov = len(qset.intersection(tset))
-        # cap overlap to keep it bounded
         ov_cap = min(12, ov)
 
         sem = float(h.get("score", 0.0) or 0.0)
@@ -904,13 +1062,14 @@ def _rerank_hits(question: str, hits: List[Dict[str, Any]]) -> List[Dict[str, An
         h["_lex_ov"] = int(ov)
         h["_blend"] = float(blend)
 
+    # doc_rank lower is better → use -doc_rank with reverse=True
     hits.sort(
         key=lambda x: (
             float(x.get("_blend", 0.0)),
             int(x.get("_lex_ov", 0)),
-            int(x.get("doc_rank", 0) or 0),
+            -_safe_int(x.get("doc_rank", 0), 0),
             str(x.get("doc_name", "")),
-            int(x.get("id", 0) or 0),
+            -_safe_int(x.get("id", 0), 0),
         ),
         reverse=True
     )
@@ -918,7 +1077,125 @@ def _rerank_hits(question: str, hits: List[Dict[str, Any]]) -> List[Dict[str, An
 
 
 # =============================================================================
-# Main retrieval
+# Internal: build evidence docs from a {id -> score} mapping (semantic or lexical)
+# =============================================================================
+def _build_evidence_from_id_scores(
+    *,
+    question: str,
+    rows: List[Dict[str, Any]],
+    id_to_row: Dict[int, Dict[str, Any]],
+    id_scores: Dict[int, float],
+    entity_kw: List[str],
+    all_kw: List[str],
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    hits: List[Dict[str, Any]] = []
+    active_set = {int(r.get("id")) for r in rows if r.get("active", True) and r.get("id") is not None}
+
+    for cid, score in id_scores.items():
+        cid_i = _safe_int(cid, -1)
+        if cid_i < 0:
+            continue
+        if cid_i not in active_set:
+            continue
+
+        r = id_to_row.get(cid_i)
+        if not r or not r.get("active", True):
+            continue
+
+        text_for_overlap = _row_text_for_matching(r)
+        overlap_entity = _keyword_overlap_count(entity_kw, text_for_overlap) if entity_kw else 0
+        overlap_all = _keyword_overlap_count(all_kw, text_for_overlap)
+        overlap = overlap_entity if entity_kw else overlap_all
+
+        doc_name = r.get("doc_name", "Unknown document")
+        doc_rank = _safe_int(r.get("doc_rank", 0), 0)
+
+        public_path = (r.get("public_path") or "").strip() or (r.get("path") or "").strip()
+        if not public_path:
+            public_path = _canonical_public_path(doc_name)
+        public_path = public_path.replace("\\", "/")
+
+        public_url = _quote_path_preserve_slash(public_path)
+
+        loc_kind = (r.get("loc_kind", "") or "").strip()
+        loc_start = r.get("loc_start")
+        loc_end = r.get("loc_end")
+
+        if (not loc_kind) and (r.get("page") is not None):
+            loc_kind = "page"
+            loc_start = r.get("page")
+            loc_end = r.get("page")
+
+        hits.append({
+            "id": int(cid_i),
+            "chunk_id": int(cid_i),
+            "score": float(score),
+            "overlap": int(overlap),
+            "doc_name": doc_name,
+            "doc_rank": doc_rank,
+            "text": (r.get("text") or ""),
+            "search_text": (r.get("search_text") or ""),
+            "source_type": r.get("source_type", ""),
+            "loc_kind": loc_kind,
+            "loc_start": loc_start,
+            "loc_end": loc_end,
+            "public_path": public_path,
+            "public_url": public_url,
+            "path": public_path,
+            "overlap_all": int(overlap_all),
+            "overlap_entity": int(overlap_entity),
+        })
+
+    if not hits:
+        return [], []
+
+    hits = _rerank_hits(question, hits)
+
+    grouped: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+    ranks: Dict[str, int] = {}
+
+    for h in hits:
+        dn = h["doc_name"]
+        grouped[dn].append(h)
+        dr = _safe_int(h.get("doc_rank", 0), 0)
+        ranks[dn] = dr if dn not in ranks else min(ranks[dn], dr)
+
+    evidence_docs: List[Dict[str, Any]] = []
+    for dn, doc_hits in grouped.items():
+        doc_hits.sort(
+            key=lambda x: (
+                float(x.get("_blend", x.get("score", 0.0)) or 0.0),
+                int(x.get("_lex_ov", x.get("overlap", 0)) or 0),
+                -_safe_int(x.get("doc_rank", 0), 0),
+            ),
+            reverse=True
+        )
+        doc_hits = doc_hits[:MAX_CHUNKS_PER_DOC]
+        evidence_docs.append({"doc_name": dn, "doc_rank": ranks.get(dn, 0), "hits": doc_hits})
+
+    # rank docs
+    def best_score(ed: Dict[str, Any]) -> float:
+        hs = ed.get("hits", [])
+        if not hs:
+            return 0.0
+        return float(hs[0].get("_blend", hs[0].get("score", 0.0)) or 0.0)
+
+    def best_overlap(ed: Dict[str, Any]) -> int:
+        hs = ed.get("hits", [])
+        if not hs:
+            return 0
+        return int(hs[0].get("_lex_ov", hs[0].get("overlap", 0)) or 0)
+
+    evidence_docs.sort(
+        key=lambda ed: (best_score(ed), best_overlap(ed), -_safe_int(ed.get("doc_rank", 0), 0)),
+        reverse=True
+    )
+
+    return hits, evidence_docs
+
+
+# =============================================================================
+# Main retrieval (never raises)
 # =============================================================================
 def retrieve(question: str, index_dir: Optional[str] = None) -> Dict[str, Any]:
     resolved_dir = _resolve_index_dir(index_dir)
@@ -936,10 +1213,10 @@ def retrieve(question: str, index_dir: Optional[str] = None) -> Dict[str, Any]:
         return empty
 
     try:
-        idx, rows, meta = _load_index_rows(index_dir=resolved_dir)
-        if idx is None or not rows:
+        idx, rows, _meta = _load_index_rows(index_dir=resolved_dir)
+        if not rows:
             if DEBUG:
-                empty["debug"] = {"index_dir": resolved_dir, "note": "Index or chunks missing/empty."}
+                empty["debug"] = {"index_dir": resolved_dir, "note": "chunks.jsonl missing/empty."}
             return empty
 
         active_rows = [r for r in rows if r.get("active", True)]
@@ -948,15 +1225,17 @@ def retrieve(question: str, index_dir: Optional[str] = None) -> Dict[str, Any]:
                 empty["debug"] = {"index_dir": resolved_dir, "rows": len(rows), "active_rows": 0}
             return empty
 
+        id_to_row = _rows_by_id(rows)
+
         global _VOCAB_CACHE, _VOCAB_INDEX_DIR
         if SPELL_CORRECTION_ENABLED and (_VOCAB_CACHE is None or _VOCAB_INDEX_DIR != resolved_dir):
             _VOCAB_CACHE = _build_vocab_from_rows(active_rows)
             _VOCAB_INDEX_DIR = resolved_dir
 
-        id_to_row = _rows_by_id(rows)
-
-        # Build queries (best effort, never required)
-        llm_queries = _llm_rewrite_queries(question) if (LLM_REWRITE_ENABLED and LLM_REWRITE_ALWAYS) else []
+        # Build queries
+        llm_queries: List[str] = []
+        if LLM_REWRITE_ENABLED and LLM_REWRITE_ALWAYS:
+            llm_queries = _llm_rewrite_queries(question) or []
 
         queries: List[str] = []
         if llm_queries:
@@ -983,48 +1262,226 @@ def retrieve(question: str, index_dir: Optional[str] = None) -> Dict[str, Any]:
         extras_kw = _intent_extra_keywords(question)
         all_kw = base_kw + [k for k in extras_kw if k not in base_kw]
 
-        # Semantic search
-        q_vecs = embed_texts(queries)
-        q_vecs = _normalize_vectors(q_vecs)
+        # -----------------------------
+        # ✅ FIX A: If FAISS missing/broken, do lexical-only retrieval
+        # -----------------------------
+        if idx is None:
+            lex_best = _lexical_fallback_hits(active_rows, all_kw, entity_kw, question)
+            if not lex_best:
+                if DEBUG:
+                    empty["debug"] = {"index_dir": resolved_dir, "note": "FAISS missing and lexical found no hits.", "queries_used": queries}
+                return empty
 
-        # Dim safety
+            hits, evidence_docs = _build_evidence_from_id_scores(
+                question=question,
+                rows=active_rows,
+                id_to_row=id_to_row,
+                id_scores=lex_best,
+                entity_kw=entity_kw,
+                all_kw=all_kw,
+            )
+            if not evidence_docs:
+                return empty
+
+            evidence_docs = evidence_docs[:MAX_DOCS_RETURNED]
+            evidence_docs = _apply_criteria_doc_prioritization(question, evidence_docs)
+
+            primary = evidence_docs[0]
+            out: Dict[str, Any] = {
+                "question": question,
+                "has_evidence": True,
+                "primary_doc": primary.get("doc_name"),
+                "primary_doc_rank": _safe_int(primary.get("doc_rank", 0), 0),
+                "evidence": evidence_docs,
+            }
+            if DEBUG:
+                out["debug"] = {
+                    "index_dir": resolved_dir,
+                    "note": "Lexical-only mode (FAISS missing).",
+                    "rows": len(rows),
+                    "active_rows": len(active_rows),
+                    "queries_used": queries,
+                    "lex_added": len(lex_best),
+                }
+            return out
+
+        # Embed queries
+        try:
+            q_vecs = embed_texts(queries)
+            q_vecs = _normalize_vectors(q_vecs)
+        except Exception as e:
+            # fallback lexical-only if embedding fails
+            lex_best = _lexical_fallback_hits(active_rows, all_kw, entity_kw, question)
+            if lex_best:
+                hits, evidence_docs = _build_evidence_from_id_scores(
+                    question=question,
+                    rows=active_rows,
+                    id_to_row=id_to_row,
+                    id_scores=lex_best,
+                    entity_kw=entity_kw,
+                    all_kw=all_kw,
+                )
+                if evidence_docs:
+                    evidence_docs = evidence_docs[:MAX_DOCS_RETURNED]
+                    evidence_docs = _apply_criteria_doc_prioritization(question, evidence_docs)
+                    primary = evidence_docs[0]
+                    out: Dict[str, Any] = {
+                        "question": question,
+                        "has_evidence": True,
+                        "primary_doc": primary.get("doc_name"),
+                        "primary_doc_rank": _safe_int(primary.get("doc_rank", 0), 0),
+                        "evidence": evidence_docs,
+                    }
+                    if DEBUG:
+                        out["debug"] = {
+                            "index_dir": resolved_dir,
+                            "note": "Embedding failed; used lexical-only fallback.",
+                            "error": str(e)[:200],
+                            "queries_used": queries,
+                            "lex_added": len(lex_best),
+                        }
+                    return out
+
+            if DEBUG:
+                empty["debug"] = {"index_dir": resolved_dir, "note": "Embedding failed and lexical empty.", "error": str(e)[:200]}
+            return empty
+
         d_idx = _faiss_dim(idx)
-        if d_idx is not None and q_vecs.ndim == 2 and q_vecs.shape[1] != d_idx:
+        try:
+            q_dim = int(q_vecs.shape[1]) if getattr(q_vecs, "ndim", 0) == 2 else None
+        except Exception:
+            q_dim = None
+
+        # -----------------------------
+        # ✅ FIX B: Auto rebuild once on FAISS dim mismatch
+        # -----------------------------
+        rebuilt_once = False
+        if d_idx is not None and q_dim is not None and q_dim != d_idx and AUTO_REBUILD_ON_DIM_MISMATCH:
+            try:
+                rebuild_index_from_chunks(index_dir=resolved_dir)
+                idx, rows, _meta = _load_index_rows(index_dir=resolved_dir)
+                id_to_row = _rows_by_id(rows)
+                active_rows = [r for r in rows if r.get("active", True)]
+                rebuilt_once = True
+                d_idx = _faiss_dim(idx)
+            except Exception:
+                pass
+
+        if idx is None:
             if DEBUG:
                 empty["debug"] = {
                     "index_dir": resolved_dir,
-                    "note": "FAISS dim mismatch (index vs query embeddings). Rebuild index.",
+                    "note": "FAISS dim mismatch and rebuild failed (idx None).",
                     "faiss_dim": d_idx,
-                    "query_dim": int(q_vecs.shape[1]),
+                    "query_dim": q_dim,
+                }
+            return empty
+
+        if d_idx is not None and q_dim is not None and q_dim != d_idx:
+            if DEBUG:
+                empty["debug"] = {
+                    "index_dir": resolved_dir,
+                    "note": "FAISS dim mismatch (index vs query embeddings).",
+                    "faiss_dim": d_idx,
+                    "query_dim": q_dim,
+                    "rebuilt_once": rebuilt_once,
                 }
             return empty
 
         k = _safe_faiss_k(idx, TOP_K)
         if k <= 0:
+            # Auto rebuild if index empty but chunks exist
+            if AUTO_REBUILD_ON_EMPTY_FAISS:
+                try:
+                    rebuild_index_from_chunks(index_dir=resolved_dir)
+                    idx, rows, _meta = _load_index_rows(index_dir=resolved_dir)
+                    id_to_row = _rows_by_id(rows)
+                    active_rows = [r for r in rows if r.get("active", True)]
+                    k = _safe_faiss_k(idx, TOP_K)
+                except Exception:
+                    pass
+
+            if k <= 0:
+                # fall back lexical-only
+                lex_best = _lexical_fallback_hits(active_rows, all_kw, entity_kw, question)
+                if lex_best:
+                    hits, evidence_docs = _build_evidence_from_id_scores(
+                        question=question,
+                        rows=active_rows,
+                        id_to_row=id_to_row,
+                        id_scores=lex_best,
+                        entity_kw=entity_kw,
+                        all_kw=all_kw,
+                    )
+                    if evidence_docs:
+                        evidence_docs = evidence_docs[:MAX_DOCS_RETURNED]
+                        evidence_docs = _apply_criteria_doc_prioritization(question, evidence_docs)
+                        primary = evidence_docs[0]
+                        out: Dict[str, Any] = {
+                            "question": question,
+                            "has_evidence": True,
+                            "primary_doc": primary.get("doc_name"),
+                            "primary_doc_rank": _safe_int(primary.get("doc_rank", 0), 0),
+                            "evidence": evidence_docs,
+                        }
+                        if DEBUG:
+                            out["debug"] = {"index_dir": resolved_dir, "note": "FAISS empty; lexical fallback used.", "lex_added": len(lex_best)}
+                        return out
+
+                if DEBUG:
+                    empty["debug"] = {"index_dir": resolved_dir, "note": "FAISS index has ntotal=0 and lexical empty."}
+                return empty
+
+        # FAISS search
+        try:
+            scores_mat, ids_mat = idx.search(q_vecs, k)
+        except Exception as e:
+            # fallback lexical-only if FAISS search fails
+            lex_best = _lexical_fallback_hits(active_rows, all_kw, entity_kw, question)
+            if lex_best:
+                hits, evidence_docs = _build_evidence_from_id_scores(
+                    question=question,
+                    rows=active_rows,
+                    id_to_row=id_to_row,
+                    id_scores=lex_best,
+                    entity_kw=entity_kw,
+                    all_kw=all_kw,
+                )
+                if evidence_docs:
+                    evidence_docs = evidence_docs[:MAX_DOCS_RETURNED]
+                    evidence_docs = _apply_criteria_doc_prioritization(question, evidence_docs)
+                    primary = evidence_docs[0]
+                    out: Dict[str, Any] = {
+                        "question": question,
+                        "has_evidence": True,
+                        "primary_doc": primary.get("doc_name"),
+                        "primary_doc_rank": _safe_int(primary.get("doc_rank", 0), 0),
+                        "evidence": evidence_docs,
+                    }
+                    if DEBUG:
+                        out["debug"] = {"index_dir": resolved_dir, "note": "FAISS search failed; lexical fallback used.", "error": str(e)[:200], "lex_added": len(lex_best)}
+                    return out
+
             if DEBUG:
-                empty["debug"] = {"index_dir": resolved_dir, "note": "FAISS index has ntotal=0."}
+                empty["debug"] = {"index_dir": resolved_dir, "note": "FAISS search failed and lexical empty.", "error": str(e)[:200]}
             return empty
 
-        scores_mat, ids_mat = idx.search(q_vecs, k)
-
-        # Collect best score per chunk_id
         best_by_id: Dict[int, float] = {}
         all_scored_pairs: List[Tuple[int, float]] = []
 
         for qi in range(len(queries)):
-            scores = scores_mat[qi].tolist()
-            ids = ids_mat[qi].tolist()
+            scores = getattr(scores_mat[qi], "tolist", lambda: list(scores_mat[qi]))()
+            ids = getattr(ids_mat[qi], "tolist", lambda: list(ids_mat[qi]))()
             for score, vid in zip(scores, ids):
-                if vid == -1:
+                vid_i = _safe_int(vid, -1)
+                if vid_i < 0:
                     continue
                 s = float(score)
-                vid_i = int(vid)
                 all_scored_pairs.append((vid_i, s))
                 prev = best_by_id.get(vid_i)
                 if prev is None or s > prev:
                     best_by_id[vid_i] = s
 
-        # Apply SIM_THRESHOLD normally; but if nothing passes, use adaptive fallback top-N
         passed = {cid: sc for cid, sc in best_by_id.items() if sc >= SIM_THRESHOLD}
         adaptive_used = False
         if passed:
@@ -1042,7 +1499,7 @@ def retrieve(question: str, index_dir: Optional[str] = None) -> Dict[str, Any]:
                     break
             best_by_id = tmp
 
-        # Lex fallback (adds recall)
+        # Lexical add-on
         lex_best = _lexical_fallback_hits(active_rows, all_kw, entity_kw, question)
         for cid, pseudo in lex_best.items():
             prev = best_by_id.get(cid)
@@ -1062,182 +1519,43 @@ def retrieve(question: str, index_dir: Optional[str] = None) -> Dict[str, Any]:
                 }
             return empty
 
-        # Build hit list with provenance (canonical references)
-        hits: List[Dict[str, Any]] = []
-        for vid_i, score in best_by_id.items():
-            r = id_to_row.get(int(vid_i))
-            if not r or not r.get("active", True):
-                continue
-
-            text_for_overlap = _row_text_for_matching(r)
-            overlap_entity = _keyword_overlap_count(entity_kw, text_for_overlap) if entity_kw else 0
-            overlap_all = _keyword_overlap_count(all_kw, text_for_overlap)
-
-            overlap = overlap_entity if entity_kw else overlap_all
-
-            doc_name = r.get("doc_name", "Unknown document")
-            doc_rank = int(r.get("doc_rank", 0) or 0)
-
-            # canonical public path
-            public_path = (r.get("public_path") or "").strip()
-            if not public_path:
-                public_path = (r.get("path") or "").strip()
-            if not public_path:
-                public_path = _canonical_public_path(doc_name)
-            public_path = public_path.replace("\\", "/")
-
-            loc_kind = (r.get("loc_kind", "") or "").strip()
-            loc_start = r.get("loc_start")
-            loc_end = r.get("loc_end")
-
-            # Back-compat: if schema uses page but not loc_*
-            if (not loc_kind) and (r.get("page") is not None):
-                loc_kind = "page"
-                loc_start = r.get("page")
-                loc_end = r.get("page")
-
-            hits.append({
-                "id": int(vid_i),
-                "chunk_id": int(vid_i),
-                "score": float(score),
-                "overlap": int(overlap),
-                "doc_name": doc_name,
-                "doc_rank": doc_rank,
-                "text": (r.get("text") or ""),
-                "search_text": (r.get("search_text") or ""),
-                "source_type": r.get("source_type", ""),
-                "loc_kind": loc_kind,
-                "loc_start": loc_start,
-                "loc_end": loc_end,
-
-                "public_path": public_path,
-                "path": public_path,  # backward compatibility
-
-                "overlap_all": int(overlap_all),
-                "overlap_entity": int(overlap_entity),
-
-                "reference": {
-                    "doc_name": doc_name,
-                    "public_path": public_path,
-                    "loc_kind": loc_kind,
-                    "loc_start": loc_start,
-                    "loc_end": loc_end,
-                },
-            })
-
-        if not hits:
+        # Build hits + evidence docs
+        hits, evidence_docs = _build_evidence_from_id_scores(
+            question=question,
+            rows=active_rows,
+            id_to_row=id_to_row,
+            id_scores=best_by_id,
+            entity_kw=entity_kw,
+            all_kw=all_kw,
+        )
+        if not evidence_docs:
             if DEBUG:
-                empty["debug"] = {"index_dir": resolved_dir, "queries_used": queries, "note": "Hits filtered to none."}
+                empty["debug"] = {"index_dir": resolved_dir, "note": "No evidence_docs after scoring."}
             return empty
 
-        # ✅ Deterministic rerank for stability
-        hits = _rerank_hits(question, hits)
-
-        # Query modes
         short_mode = _is_short_query(question)
         sched_mode = _is_schedule_query(question)
         yesno_mode = _is_yesno_query(question)
         def_mode = _is_definition_query(question)
 
-        # Soft gating:
-        strong_hits = [h for h in hits if float(h["score"]) >= STRONG_SIM_THRESHOLD]
-
-        grouped_all: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
-        for h in hits:
-            grouped_all[h["doc_name"]].append(h)
-
-        keep_hits: List[Dict[str, Any]] = []
-        for dn, doc_hits in grouped_all.items():
-            doc_hits.sort(
-                key=lambda x: (
-                    float(x.get("_blend", x.get("score", 0.0))),
-                    int(x.get("_lex_ov", x.get("overlap", 0))),
-                ),
-                reverse=True
-            )
-            keep_hits.extend(doc_hits[:max(1, KEEP_TOP_SEMANTIC_PER_DOC)])
-
-        kept_set = {(h["doc_name"], h["id"]) for h in keep_hits}
-        for h in strong_hits:
-            kept_set.add((h["doc_name"], h["id"]))
-
-        # Modes: recall-first in short/schedule/yesno/definition
-        if short_mode or sched_mode or yesno_mode or def_mode:
-            final_hits = hits
-        else:
-            final_hits = []
-            for h in hits:
-                key = (h["doc_name"], h["id"])
-                if key in kept_set:
-                    final_hits.append(h)
-                    continue
-                sc = float(h.get("score", 0.0) or 0.0)
-                ov = int(h.get("overlap_all", 0) or 0)
-                if sc >= (SIM_THRESHOLD + 0.04):
-                    final_hits.append(h)
-                    continue
-                if ov >= 1:
-                    final_hits.append(h)
-
-            if not final_hits:
-                final_hits = keep_hits or hits
-
-        # Group into evidence docs
-        grouped: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
-        ranks: Dict[str, int] = {}
-        for h in final_hits:
-            dn = h["doc_name"]
-            grouped[dn].append(h)
-            ranks[dn] = max(ranks.get(dn, 0), int(h.get("doc_rank", 0) or 0))
-
-        evidence_docs: List[Dict[str, Any]] = []
-        for dn, doc_hits in grouped.items():
-            doc_hits.sort(
-                key=lambda x: (
-                    float(x.get("_blend", x.get("score", 0.0)) or 0.0),
-                    int(x.get("_lex_ov", x.get("overlap", 0)) or 0),
-                    int(x.get("doc_rank", 0) or 0),
-                ),
-                reverse=True
-            )
-            doc_hits = doc_hits[:MAX_CHUNKS_PER_DOC]
-            evidence_docs.append({"doc_name": dn, "doc_rank": ranks.get(dn, 0), "hits": doc_hits})
-
-        if not evidence_docs:
-            if DEBUG:
-                empty["debug"] = {"index_dir": resolved_dir, "note": "No evidence_docs after grouping."}
-            return empty
-
+        # Keep docs relative to best doc
         def best_score(ed: Dict[str, Any]) -> float:
             hs = ed.get("hits", [])
             if not hs:
                 return 0.0
             return float(hs[0].get("_blend", hs[0].get("score", 0.0)) or 0.0)
 
-        def best_overlap(ed: Dict[str, Any]) -> int:
-            hs = ed.get("hits", [])
-            if not hs:
-                return 0
-            return int(hs[0].get("_lex_ov", hs[0].get("overlap", 0)) or 0)
-
-        evidence_docs.sort(
-            key=lambda ed: (best_score(ed), best_overlap(ed), ed.get("doc_rank", 0)),
-            reverse=True
-        )
-
-        strong_docs = [
-            ed for ed in evidence_docs
-            if ed.get("hits") and float(ed["hits"][0].get("score", 0.0)) >= STRONG_SIM_THRESHOLD
-        ]
-        primary = strong_docs[0] if strong_docs else evidence_docs[0]
-
-        best = best_score(primary)
+        best_doc_score = best_score(evidence_docs[0]) if evidence_docs else 0.0
         kept_docs: List[Dict[str, Any]] = []
         for ed in evidence_docs:
-            if best <= 0:
+            if best_doc_score <= 0:
                 continue
-            if best_score(ed) >= best * RELATIVE_DOC_SCORE_KEEP:
+            if best_score(ed) >= best_doc_score * RELATIVE_DOC_SCORE_KEEP:
                 kept_docs.append(ed)
+
+        # ensure some docs kept for short/schedule/yesno/def
+        if (short_mode or sched_mode or yesno_mode or def_mode) and not kept_docs:
+            kept_docs = evidence_docs[:MAX_DOCS_RETURNED]
 
         kept_docs = kept_docs[:MAX_DOCS_RETURNED]
         kept_docs = _apply_criteria_doc_prioritization(question, kept_docs)
@@ -1245,11 +1563,13 @@ def retrieve(question: str, index_dir: Optional[str] = None) -> Dict[str, Any]:
         if not kept_docs:
             return empty
 
+        primary = kept_docs[0]
+
         out: Dict[str, Any] = {
             "question": question,
             "has_evidence": True,
             "primary_doc": primary.get("doc_name"),
-            "primary_doc_rank": int(primary.get("doc_rank", 0) or 0),
+            "primary_doc_rank": _safe_int(primary.get("doc_rank", 0), 0),
             "evidence": kept_docs
         }
 
@@ -1274,11 +1594,13 @@ def retrieve(question: str, index_dir: Optional[str] = None) -> Dict[str, Any]:
                 "rerank_enabled": RERANK_ENABLED,
                 "rerank_alpha": RERANK_ALPHA,
                 "rerank_beta": RERANK_BETA,
+                "auto_rebuild_dim_mismatch": AUTO_REBUILD_ON_DIM_MISMATCH,
+                "rebuilt_once": rebuilt_once,
             }
 
         return out
 
     except Exception as e:
         if DEBUG:
-            empty["debug"] = {"index_dir": resolved_dir, "error": str(e)}
+            empty["debug"] = {"index_dir": resolved_dir, "error": str(e)[:220]}
         return empty
